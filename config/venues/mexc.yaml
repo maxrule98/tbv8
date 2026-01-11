@@ -1,0 +1,12 @@
+venue: mexc
+enabled: true
+
+ws_url: "wss://contract.mexc.com/edge"
+rest_url: "https://example.mexc.api"
+
+# For now leave blank; we’ll add keys when we implement execution.
+api_key: ""
+api_secret: ""
+
+symbols:
+  - "BTC/USDT"

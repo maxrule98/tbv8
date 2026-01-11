@@ -1,0 +1,11 @@
+venue: hyperliquid
+enabled: true
+
+ws_url: "wss://api.hyperliquid.xyz/ws"
+rest_url: "https://api.hyperliquid.xyz"
+
+wallet_address: ""
+private_key: "" # DO NOT commit real keys. We'll load via env later.
+
+symbols:
+  - "BTC/USDT"
