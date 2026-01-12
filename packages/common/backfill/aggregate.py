@@ -1,33 +1,36 @@
 from __future__ import annotations
 
 import sqlite3
-from dataclasses import dataclass
-from typing import Iterable, Iterator, List
+from dataclasses import replace
+from typing import List, Sequence
 
 from loguru import logger
 
-from packages.common.backfill.types import OHLCV
 from packages.common.timeframes import floor_ts_to_tf
+from packages.common.backfill.types import OHLCV
 from packages.common.backfill.sqlite_store import upsert_agg
 
 
-@dataclass(frozen=True)
-class LoadRange:
-    venue: str
-    symbol: str
-    start_ms: int
-    end_ms: int
+def load_1m_range(
+    conn: sqlite3.Connection,
+    venue: str,
+    symbol: str,
+    start_ms: int,
+    end_ms: int,
+) -> List[OHLCV]:
+    """
+    Load 1m OHLCV bars from the canonical base table: ohlcv_1m.
 
-
-def load_1m_range(conn: sqlite3.Connection, q: LoadRange) -> List[OHLCV]:
+    Range semantics: [start_ms, end_ms)
+    """
     rows = conn.execute(
         """
         SELECT ts_ms, open, high, low, close, volume
         FROM ohlcv_1m
-        WHERE venue=? AND symbol=? AND ts_ms >= ? AND ts_ms < ?
+        WHERE venue = ? AND symbol = ? AND ts_ms >= ? AND ts_ms < ?
         ORDER BY ts_ms ASC
         """,
-        (q.venue, q.symbol, q.start_ms, q.end_ms),
+        (venue, symbol, int(start_ms), int(end_ms)),
     ).fetchall()
 
     return [
@@ -43,126 +46,90 @@ def load_1m_range(conn: sqlite3.Connection, q: LoadRange) -> List[OHLCV]:
     ]
 
 
-def aggregate_from_1m(bars_1m: Iterable[OHLCV], timeframe: str) -> List[OHLCV]:
+def aggregate_from_1m(base: Sequence[OHLCV], timeframe: str) -> List[OHLCV]:
     """
-    Deterministic OHLCV aggregation from 1m -> timeframe.
+    Aggregate sorted 1m bars into a higher timeframe.
 
-    Important: OHLCV is immutable (frozen dataclass), so we aggregate using local
-    variables and instantiate OHLCV when a bucket closes.
+    - Output ts_ms is floored to the timeframe bucket.
+    - Safe with frozen dataclasses (uses dataclasses.replace).
     """
-    if timeframe == "1m":
-        return list(bars_1m)
+    if not base:
+        return []
 
     out: List[OHLCV] = []
+    cur: OHLCV | None = None
 
-    cur_bucket: int | None = None
-    o = h = l = c = v = None  # type: ignore[assignment]
-
-    def flush(bucket_ts: int) -> None:
-        nonlocal o, h, l, c, v
-        if o is None:
-            return
-        out.append(
-            OHLCV(
-                ts_ms=bucket_ts,
-                open=float(o),
-                high=float(h),
-                low=float(l),
-                close=float(c),
-                volume=float(v),
-            )
-        )
-        o = h = l = c = v = None  # reset
-
-    for b in bars_1m:
+    for b in base:
         bucket = floor_ts_to_tf(b.ts_ms, timeframe)
 
-        if cur_bucket is None:
-            # first bar
-            cur_bucket = bucket
-            o, h, l, c, v = b.open, b.high, b.low, b.close, b.volume
+        if cur is None or cur.ts_ms != bucket:
+            cur = OHLCV(
+                ts_ms=int(bucket),
+                open=float(b.open),
+                high=float(b.high),
+                low=float(b.low),
+                close=float(b.close),
+                volume=float(b.volume),
+            )
+            out.append(cur)
             continue
 
-        if bucket != cur_bucket:
-            # bucket rollover
-            flush(cur_bucket)
-            cur_bucket = bucket
-            o, h, l, c, v = b.open, b.high, b.low, b.close, b.volume
-            continue
-
-        # same bucket - update accumulators
-        h = max(h, b.high)
-        l = min(l, b.low)
-        c = b.close
-        v = v + b.volume
-
-    if cur_bucket is not None:
-        flush(cur_bucket)
+        updated = replace(
+            cur,
+            high=max(cur.high, b.high),
+            low=min(cur.low, b.low),
+            close=b.close,
+            volume=cur.volume + b.volume,
+        )
+        out[-1] = updated
+        cur = updated
 
     return out
 
 
-def iter_ranges(start_ms: int, end_ms: int, chunk_ms: int) -> Iterator[tuple[int, int]]:
-    cur = start_ms
-    while cur < end_ms:
-        nxt = min(cur + chunk_ms, end_ms)
-        yield cur, nxt
-        cur = nxt
-
-
 def build_aggregates(
-    *,
-    db_path: str,
+    conn: sqlite3.Connection,
     venue: str,
     symbol: str,
     start_ms: int,
     end_ms: int,
-    timeframes: List[str],
+    timeframes: Sequence[str],
     chunk_days: int = 7,
 ) -> None:
     """
-    Aggregates ohlcv_1m -> bars_{tf} in time chunks to avoid loading the entire
-    history into memory.
+    Chunked aggregation helper (used by apps.aggregator.main).
+    Reads from ohlcv_1m and writes to bars_{tf}.
     """
-    tfs = [tf for tf in timeframes if tf != "1m"]
-    if not tfs:
-        logger.info("No aggregate timeframes requested (only 1m). Nothing to do.")
+    targets = [tf for tf in timeframes if tf != "1m"]
+    if not targets:
         return
 
-    chunk_ms = chunk_days * 24 * 60 * 60 * 1000
+    chunk_ms = int(chunk_days) * 24 * 60 * 60 * 1000
+    cursor = int(start_ms)
 
-    conn = sqlite3.connect(db_path)
-    try:
-        logger.info(
-            "Aggregating {} {} from {}..{} into {} (chunk_days={})",
-            venue,
-            symbol,
-            start_ms,
-            end_ms,
-            tfs,
-            chunk_days,
-        )
+    logger.info(
+        "Aggregating {} {} from {}..{} into {} (chunk_days={})",
+        venue,
+        symbol,
+        start_ms,
+        end_ms,
+        targets,
+        chunk_days,
+    )
 
-        for i, (a, b) in enumerate(iter_ranges(start_ms, end_ms, chunk_ms), start=1):
-            base = load_1m_range(conn, LoadRange(venue=venue, symbol=symbol, start_ms=a, end_ms=b))
-            if not base:
-                continue
+    while cursor < end_ms:
+        chunk_end = min(cursor + chunk_ms, int(end_ms))
 
-            for tf in tfs:
-                agg = aggregate_from_1m(base, tf)
-                wrote = upsert_agg(conn, tf, venue, symbol, agg)
-                logger.info(
-                    "chunk={} tf={} range=[{}..{}) base={} wrote={}",
-                    i,
-                    tf,
-                    a,
-                    b,
-                    len(base),
-                    wrote,
-                )
+        base = load_1m_range(conn, venue, symbol, cursor, chunk_end)
+        if base:
+            for tf in targets:
+                agg = aggregate_from_1m(base, timeframe=tf)
+                if agg:
+                    upserted = upsert_agg(conn, tf, venue, symbol, agg)
+                    logger.info("Aggregated chunk {}..{} 1m -> {} upserted={}", cursor, chunk_end, tf, upserted)
 
             conn.commit()
 
-        logger.info("Aggregation complete.")
-    finally:
-        conn.close()
+        cursor = chunk_end
+
+    logger.info("Aggregation complete.")

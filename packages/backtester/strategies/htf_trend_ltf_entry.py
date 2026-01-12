@@ -5,7 +5,7 @@ from typing import Optional
 
 from loguru import logger
 
-from packages.common.sqlite_store import Bar1m
+from packages.backtester.types import Bar
 from packages.backtester.aggregate import Aggregator
 from packages.backtester.indicators import SMA, EMA
 
@@ -69,7 +69,7 @@ class HTFTrendLTFEntryStrategy:
         self._last_target: int = 0
         self._last_target_ts_ms: Optional[int] = None
 
-    def _warmup_trend(self, htf_bar: Bar1m) -> int:
+    def _warmup_trend(self, htf_bar: Bar) -> int:
         """
         Determine trend before SMA is ready.
 
@@ -118,9 +118,9 @@ class HTFTrendLTFEntryStrategy:
 
         return proposed_target
 
-    def on_bar(self, bar_1m: Bar1m) -> int:
+    def on_bar(self, bar: Bar) -> int:
         # 1) Update HTF aggregation
-        htf_bar = self.agg.on_bar_1m(bar_1m)
+        htf_bar = self.agg.on_bar(bar)
         if htf_bar is not None:
             self._htf_count += 1
             sma = self.htf_sma.update(float(htf_bar.close))
@@ -151,7 +151,7 @@ class HTFTrendLTFEntryStrategy:
             self._prev_htf_close = float(htf_bar.close)
 
         # 2) Update LTF EMA
-        ltf_close = float(bar_1m.close)
+        ltf_close = float(bar.close)
         ema = self.ltf_ema.update(ltf_close)
         if ema is not None:
             self._last_ema = float(ema)
@@ -168,17 +168,17 @@ class HTFTrendLTFEntryStrategy:
                     proposed = -1
 
         # 4) Debounce flips (min-hold)
-        target = self._apply_min_hold(bar_1m.ts_ms, proposed)
+        target = self._apply_min_hold(bar.ts_ms, proposed)
 
         # Track last non-zero target transitions (for min-hold)
         if target != 0 and target != self._last_target:
             self._last_target = target
-            self._last_target_ts_ms = bar_1m.ts_ms
+            self._last_target_ts_ms = bar.ts_ms
 
-        if self.cfg.debug and (bar_1m.ts_ms // 60_000) % 5 == 0:  # occasional log
+        if self.cfg.debug and (bar.ts_ms // 60_000) % 5 == 0:  # occasional log
             logger.info(
                 "LTF t={} close={:.2f} ema={} trend={} proposed={} -> target={}",
-                bar_1m.ts_ms,
+                bar.ts_ms,
                 ltf_close,
                 f"{self._last_ema:.2f}" if self._last_ema is not None else None,
                 self._trend,

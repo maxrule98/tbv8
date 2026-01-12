@@ -60,6 +60,7 @@ class BackfillService:
 
             max_ts = get_max_ts(conn, adapter.venue, spec.symbol, "1m")
 
+            # Determine what we fetch
             if max_ts is None:
                 fetch_start = start_ms
                 logger.info(
@@ -79,6 +80,7 @@ class BackfillService:
                         max_ts,
                         end_ms,
                     )
+                    # Still ensure aggregates exist/are refreshed over requested window
                     self._aggregate_all(conn, adapter.venue, spec.symbol, start_ms, end_ms, spec.timeframes)
                     conn.commit()
                     return
@@ -106,7 +108,19 @@ class BackfillService:
                 ),
             )
 
-            self._aggregate_all(conn, adapter.venue, spec.symbol, start_ms, end_ms, spec.timeframes)
+            # Aggregate efficiently:
+            # - bootstrap: full [start_ms..end_ms)
+            # - tail update: only from (fetch_start - max_tf_ms) to end_ms to rebuild boundary buckets
+            agg_start = start_ms
+            if max_ts is not None:
+                max_tf_ms = 0
+                for tf in spec.timeframes:
+                    if tf != "1m":
+                        max_tf_ms = max(max_tf_ms, timeframe_to_ms(tf))
+                if max_tf_ms > 0:
+                    agg_start = max(start_ms, fetch_start - max_tf_ms)
+
+            self._aggregate_all(conn, adapter.venue, spec.symbol, agg_start, end_ms, spec.timeframes)
 
             conn.commit()
             logger.info("ensure_history complete venue={} symbol={} [{}..{})", adapter.venue, spec.symbol, start_ms, end_ms)
@@ -114,9 +128,16 @@ class BackfillService:
         finally:
             conn.close()
 
-    async def _backfill_1m(self, conn: sqlite3.Connection, adapter: BackfillAdapter, symbol: str, start_ms: int, end_ms: int) -> None:
+    async def _backfill_1m(
+        self,
+        conn: sqlite3.Connection,
+        adapter: BackfillAdapter,
+        symbol: str,
+        start_ms: int,
+        end_ms: int,
+    ) -> None:
         tf_ms = timeframe_to_ms("1m")
-        cursor = start_ms
+        cursor = int(start_ms)
         pages = 0
         total_rows = 0
 
@@ -165,12 +186,14 @@ class BackfillService:
         if not targets:
             return
 
-        base = load_1m_range(conn, venue=venue, symbol=symbol, start_ms=start_ms, end_ms=end_ms)
+        base = load_1m_range(conn, venue, symbol, start_ms, end_ms)
         if not base:
             logger.warning("No 1m bars for venue={} symbol={} in [{}..{}) - cannot aggregate", venue, symbol, start_ms, end_ms)
             return
 
         for tf in targets:
             agg = aggregate_from_1m(base, timeframe=tf)
+            if not agg:
+                continue
             upserted = upsert_agg(conn, tf, venue, symbol, agg)
             logger.info("Aggregated 1m -> {} upserted={}", tf, upserted)

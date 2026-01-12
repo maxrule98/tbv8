@@ -1,15 +1,29 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Optional
 
-from packages.common.sqlite_store import Bar1m
+from packages.backtester.types import Bar
 
+# -----------------------------
+# Time bucketing
+# -----------------------------
 
 def bucket_ms(ts_ms: int, minutes: int) -> int:
+    """
+    Floor a timestamp into its HTF bucket.
+
+    Example:
+      ts = 12:07, minutes=5  -> bucket = 12:05
+      ts = 12:10, minutes=5  -> bucket = 12:10
+    """
     step = minutes * 60_000
     return (ts_ms // step) * step
 
+
+# -----------------------------
+# Internal aggregation state
+# -----------------------------
 
 @dataclass
 class AggState:
@@ -18,61 +32,80 @@ class AggState:
     high: float
     low: float
     close: float
-    count: int
+    volume: float
 
+
+# -----------------------------
+# Streaming aggregator
+# -----------------------------
 
 class Aggregator:
     """
-    Online aggregator: feed 1m bars, emits completed HTF bars on rollover.
+    Online HTF aggregator.
+
+    Feed it bars from a *single* instrument stream
+    (1m, 5m, etc) and it emits completed HTF bars.
+
+    Example:
+        agg = Aggregator(minutes=60)   # build 1h candles from 1m or 5m feed
+        for bar in bars:
+            htf = agg.on_bar(bar)
+            if htf:
+                handle(htf)
     """
 
     def __init__(self, minutes: int):
         if minutes <= 1:
-            raise ValueError("minutes must be > 1")
+            raise ValueError("HTF minutes must be > 1")
         self.minutes = minutes
-        self._st: Dict[Tuple[str, str], AggState] = {}
+        self._state: Optional[AggState] = None
 
-    def on_bar_1m(self, b: Bar1m) -> Optional[Bar1m]:
-        key = (b.venue, b.symbol)
+    def on_bar(self, b: Bar) -> Optional[Bar]:
+        """
+        Feed one LTF bar.
+        Returns a completed HTF Bar when a bucket rolls over, else None.
+        """
         buck = bucket_ms(b.ts_ms, self.minutes)
+        st = self._state
 
-        st = self._st.get(key)
+        # First bar
         if st is None:
-            self._st[key] = AggState(
+            self._state = AggState(
                 ts_ms=buck,
                 open=b.open,
                 high=b.high,
                 low=b.low,
                 close=b.close,
-                count=1,
+                volume=b.volume,
             )
             return None
 
+        # Still in same HTF candle
         if buck == st.ts_ms:
             st.high = max(st.high, b.high)
             st.low = min(st.low, b.low)
             st.close = b.close
-            st.count += 1
+            st.volume += b.volume
             return None
 
-        # rollover -> emit completed HTF bar
-        out = Bar1m(
-            venue=b.venue,
-            symbol=b.symbol,
+        # Bucket rollover -> emit completed HTF candle
+        out = Bar(
             ts_ms=st.ts_ms,
             open=st.open,
             high=st.high,
             low=st.low,
             close=st.close,
-            quote_count=st.count,
+            volume=st.volume,
         )
 
-        self._st[key] = AggState(
+        # Start new HTF candle
+        self._state = AggState(
             ts_ms=buck,
             open=b.open,
             high=b.high,
             low=b.low,
             close=b.close,
-            count=1,
+            volume=b.volume,
         )
+
         return out

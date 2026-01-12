@@ -40,6 +40,9 @@ def _maybe_ms(iso: Optional[str]) -> Optional[int]:
         return None
     return _iso_to_ms(iso)
 
+def _ms_to_utc_str(ms: int) -> str:
+    return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).isoformat().replace("+00:00", "Z")
+
 
 def main() -> None:
     cfg = load_tbv8_config()
@@ -64,6 +67,10 @@ def main() -> None:
             # limit=200_000,  # optional cap for quick tests
         )
     )
+
+    if bars:
+        logger.info("Bars range: first={} last={}", _ms_to_utc_str(bars[0].ts_ms), _ms_to_utc_str(bars[-1].ts_ms))
+
 
     logger.info(
         "Loaded bars: {} (venue={} symbol={} tf={} start={} end={})",
@@ -106,6 +113,10 @@ def main() -> None:
     )
 
     res = engine.run(bars, strat, venue=venue, symbol=symbol)
+
+    if res.trades:
+        logger.info("Last trade ts={} ({})", res.trades[-1].ts_ms, _ms_to_utc_str(res.trades[-1].ts_ms))
+
 
     print("")
     print("===== TBV8 BACKTEST RESULT =====")
