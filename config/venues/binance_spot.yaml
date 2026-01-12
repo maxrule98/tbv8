@@ -1,9 +1,0 @@
-venue: binance_spot
-enabled: false # important - we don’t want it treated as an execution venue
-
-# these fields are required by VenueConfig, but we won't use WS for spot backfill
-ws_url: ""
-rest_url: "https://api.binance.com"
-
-symbols:
-  - BTC/USDT

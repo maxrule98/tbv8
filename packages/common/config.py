@@ -6,7 +6,7 @@ from typing import Any, List, Optional
 import yaml
 from pydantic import BaseModel, Field
 
-from .types import RoutingMode, VenueId
+from .types import MarketDataVenueId, RoutingMode, VenueId
 
 
 class VenueConfig(BaseModel):
@@ -51,12 +51,11 @@ class HistoryConfig(BaseModel):
     """
     Controls how much historical data we want locally.
 
-    start_date: required for deterministic bootstraps (e.g. Binance BTC/USDT from 2017)
+    market_data_venue: which venue to use as the research/backfill source, e.g. "binance_spot"
+    start_date: required for deterministic bootstraps
     end_date: optional; if null/empty -> 'now' at runtime
-    market_data_venue: which venue to use as the *research/backfill* source, e.g. "binance_spot"
     """
-
-    market_data_venue: VenueId = "binance_spot"
+    market_data_venue: MarketDataVenueId = "binance_spot"
     start_date: str = "2017-08-17T00:00:00Z"
     end_date: Optional[str] = None
 
@@ -65,7 +64,6 @@ class DataConfig(BaseModel):
     """
     Storage locations.
     """
-
     db_path: str = "data/tbv8.sqlite"
 
 
@@ -102,7 +100,7 @@ def load_tbv8_config(
     history_path: Path = Path("config/history.yaml"),
     data_path: Path = Path("config/data.yaml"),
 ) -> TBV8Config:
-    # ---- venues (load ALL, then filter enabled)
+    # ---- venues (execution venues)
     venue_cfgs: List[VenueConfig] = []
     for p in sorted(venues_dir.glob("*.yaml")):
         raw = _load_yaml(p)
@@ -121,7 +119,7 @@ def load_tbv8_config(
     history = HistoryConfig.model_validate(history_raw) if history_raw else HistoryConfig()
     data_cfg = DataConfig.model_validate(data_raw) if data_raw else DataConfig()
 
-    # ---- sanity checks for routing venues (EXECUTION VENUES)
+    # ---- sanity checks for routing venues (execution-only)
     prim = strategy.routing.primary
     if not any(v.venue == prim for v in enabled):
         raise ValueError(f"Primary venue '{prim}' not enabled/found in {venues_dir}")
@@ -130,13 +128,7 @@ def load_tbv8_config(
     if sec and not any(v.venue == sec for v in enabled):
         raise ValueError(f"Secondary venue '{sec}' not enabled/found in {venues_dir}")
 
-    # ---- sanity check for history venue (RESEARCH/BACKFILL VENUE)
-    # history venue must exist in venues_dir, but does NOT need to be enabled.
-    mdv = history.market_data_venue
-    if not any(v.venue == mdv for v in venue_cfgs):
-        raise ValueError(f"History market_data_venue '{mdv}' not found in {venues_dir}")
-
-    # ---- light sanity for history dates
+    # ---- sanity for history dates
     if not history.start_date:
         raise ValueError("history.start_date must be set (e.g. '2017-08-17T00:00:00Z')")
 

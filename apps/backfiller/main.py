@@ -2,43 +2,64 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from typing import List
+
 from loguru import logger
 
 from packages.common.config import load_tbv8_config
+from packages.market_data.plant import EnsureHistoryRequest, MarketDataPlant
 
-# NOTE: your backfill modules currently live under packages/common/backfill/
-from packages.common.backfill.service import BackfillService, BackfillSpec
-
-# If you already have a binance adapter, import it here.
-# If not, comment this out until we add it.
 from packages.adapters.binance_spot.backfill import BinanceSpotBackfillAdapter
+
+
+def _resolve_timeframes(strategy_timeframe: str) -> List[str]:
+    """
+    v1 rule (simple + correct):
+    - Always backfill base 1m into ohlcv_1m
+    - Ensure aggregates for the strategy timeframe as well (if not 1m)
+
+    Later, when strategies declare multi-tf inputs, this becomes:
+      ["1m", *strategy.required_timeframes]
+    """
+    tfs = ["1m"]
+    tf = strategy_timeframe.strip()
+    if tf and tf != "1m":
+        tfs.append(tf)
+    return tfs
 
 
 async def _run() -> None:
     cfg = load_tbv8_config()
 
-    # v0: we backfill 1m and aggregate locally
-    # For now we just request whatever strategy timeframe is, and the service can
-    # treat 1m as base and aggregate.
-    timeframes = [cfg.strategy.timeframe]
+    timeframes = _resolve_timeframes(cfg.strategy.timeframe)
 
-    spec = BackfillSpec(
-        db_path=cfg.data.db_path,
-        venue=cfg.history.market_data_venue,
+    plant = MarketDataPlant(
+        cfg,
+        backfill_adapters=[
+            BinanceSpotBackfillAdapter(),  # venue="binance_spot"
+        ],
+    )
+
+    req = EnsureHistoryRequest(
+        venue=str(cfg.history.market_data_venue),
         symbol=cfg.strategy.symbol,
         start_date=cfg.history.start_date,
         end_date=cfg.history.end_date,
         timeframes=timeframes,
     )
 
-    svc = BackfillService(
-        adapters=[
-            BinanceSpotBackfillAdapter(),  # venue="binance_spot"
-        ]
+    logger.info(
+        "Backfiller starting venue={} symbol={} tfs={} start={} end={}",
+        req.venue,
+        req.symbol,
+        list(req.timeframes),
+        req.start_date,
+        req.end_date or "NOW",
     )
 
-    await svc.ensure_history(spec)
-    logger.info("Backfiller complete.")
+    await plant.ensure_local_history(req)
+
+    logger.info("Backfiller complete db={}", cfg.data.db_path)
 
 
 def main() -> None:
