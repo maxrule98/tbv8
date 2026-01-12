@@ -47,9 +47,33 @@ class StrategyConfig(BaseModel):
     routing: RoutingConfig
 
 
+class HistoryConfig(BaseModel):
+    """
+    Controls how much historical data we want locally.
+
+    start_date: required for deterministic bootstraps (e.g. Binance BTC/USDT from 2017)
+    end_date: optional; if null/empty -> 'now' at runtime
+    market_data_venue: which venue to use as the *research/backfill* source, e.g. "binance_spot"
+    """
+
+    market_data_venue: VenueId = "binance_spot"
+    start_date: str = "2017-08-17T00:00:00Z"
+    end_date: Optional[str] = None
+
+
+class DataConfig(BaseModel):
+    """
+    Storage locations.
+    """
+
+    db_path: str = "data/tbv8.sqlite"
+
+
 class TBV8Config(BaseModel):
     venues: List[VenueConfig]
     strategy: StrategyConfig
+    history: HistoryConfig = Field(default_factory=HistoryConfig)
+    data: DataConfig = Field(default_factory=DataConfig)
 
 
 def _load_yaml(path: Path) -> dict[str, Any]:
@@ -61,29 +85,72 @@ def _load_yaml(path: Path) -> dict[str, Any]:
     return data
 
 
+def _maybe_load_yaml(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    data = yaml.safe_load(path.read_text())
+    if data is None:
+        return {}
+    if not isinstance(data, dict):
+        raise ValueError(f"Invalid YAML structure in {path}")
+    return data
+
+
 def load_tbv8_config(
     venues_dir: Path = Path("config/venues"),
     strategy_path: Path = Path("config/strategies/btc_usdt_perp_v1.yaml"),
+    history_path: Path = Path("config/history.yaml"),
+    data_path: Path = Path("config/data.yaml"),
 ) -> TBV8Config:
+    # ---- venues (load ALL, then filter enabled)
     venue_cfgs: List[VenueConfig] = []
     for p in sorted(venues_dir.glob("*.yaml")):
         raw = _load_yaml(p)
         venue_cfgs.append(VenueConfig.model_validate(raw))
 
+    enabled = [v for v in venue_cfgs if v.enabled]
+
+    # ---- strategy
     strat_raw = _load_yaml(strategy_path)
     strategy = StrategyConfig.model_validate(strat_raw)
 
-    # Only include enabled venues
-    enabled = [v for v in venue_cfgs if v.enabled]
+    # ---- history + data (optional files)
+    history_raw = _maybe_load_yaml(history_path)
+    data_raw = _maybe_load_yaml(data_path)
 
-    # Sanity: ensure primary exists
+    history = HistoryConfig.model_validate(history_raw) if history_raw else HistoryConfig()
+    data_cfg = DataConfig.model_validate(data_raw) if data_raw else DataConfig()
+
+    # ---- sanity checks for routing venues (EXECUTION VENUES)
     prim = strategy.routing.primary
     if not any(v.venue == prim for v in enabled):
         raise ValueError(f"Primary venue '{prim}' not enabled/found in {venues_dir}")
 
-    # Sanity: if secondary configured, ensure exists
     sec = strategy.routing.secondary
     if sec and not any(v.venue == sec for v in enabled):
         raise ValueError(f"Secondary venue '{sec}' not enabled/found in {venues_dir}")
 
-    return TBV8Config(venues=enabled, strategy=strategy)
+    # ---- sanity check for history venue (RESEARCH/BACKFILL VENUE)
+    # history venue must exist in venues_dir, but does NOT need to be enabled.
+    mdv = history.market_data_venue
+    if not any(v.venue == mdv for v in venue_cfgs):
+        raise ValueError(f"History market_data_venue '{mdv}' not found in {venues_dir}")
+
+    # ---- light sanity for history dates
+    if not history.start_date:
+        raise ValueError("history.start_date must be set (e.g. '2017-08-17T00:00:00Z')")
+
+    # end_date may be None/"" to mean "now"
+    if history.end_date is not None and history.end_date.strip() == "":
+        history = HistoryConfig(
+            market_data_venue=history.market_data_venue,
+            start_date=history.start_date,
+            end_date=None,
+        )
+
+    return TBV8Config(
+        venues=enabled,
+        strategy=strategy,
+        history=history,
+        data=data_cfg,
+    )

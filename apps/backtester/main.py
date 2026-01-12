@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional
 
 from loguru import logger
 
-from packages.backtester.db import LoadBarsQuery, load_bars_1m
+from packages.common.config import load_tbv8_config
+from packages.backtester.db import LoadBarsQuery, load_bars
 from packages.backtester.engine import BacktestConfig, BacktestEngine, FillModel
 from packages.backtester.strategies.htf_trend_ltf_entry import (
     HTFTrendLTFEntryConfig,
@@ -14,38 +17,81 @@ from packages.backtester.strategies.htf_trend_ltf_entry import (
 DB_PATH = Path("data/tbv8.sqlite")
 
 
-def main() -> None:
-    # Start with one venue so results are interpretable.
-    # You can run it twice (hyperliquid then mexc) and compare.
-    venue = "hyperliquid"
-    symbol = "BTC/USDT"
+def _iso_to_ms(iso: str) -> int:
+    """
+    Accepts ISO strings like:
+      - 2017-08-17T00:00:00Z
+      - 2017-08-17T00:00:00+00:00
+    Returns epoch ms (UTC).
+    """
+    s = iso.strip()
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    dt = datetime.fromisoformat(s)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return int(dt.timestamp() * 1000)
 
-    bars = load_bars_1m(
+
+def _maybe_ms(iso: Optional[str]) -> Optional[int]:
+    if iso is None:
+        return None
+    if not iso.strip():
+        return None
+    return _iso_to_ms(iso)
+
+
+def main() -> None:
+    cfg = load_tbv8_config()
+    strat_cfg = cfg.strategy
+
+    # ✅ Backtest data venue comes from history config (Binance spot, etc.)
+    venue = cfg.history.market_data_venue
+    symbol = strat_cfg.symbol
+    timeframe = strat_cfg.timeframe  # e.g. "1m", "5m", "1h"
+
+    start_ms = _maybe_ms(cfg.history.start_date)
+    end_ms = _maybe_ms(cfg.history.end_date)  # None means "up to latest in DB"
+
+    bars = load_bars(
         LoadBarsQuery(
             db_path=DB_PATH,
             venue=venue,
             symbol=symbol,
-            # limit=50_000,  # optionally cap
+            timeframe=timeframe,
+            start_ms=start_ms,
+            end_ms=end_ms,
+            # limit=200_000,  # optional cap for quick tests
         )
     )
 
-    logger.info("Loaded bars_1m: {} ({} {})", len(bars), venue, symbol)
+    logger.info(
+        "Loaded bars: {} (venue={} symbol={} tf={} start={} end={})",
+        len(bars),
+        venue,
+        symbol,
+        timeframe,
+        cfg.history.start_date,
+        cfg.history.end_date or "NOW",
+    )
+
     if len(bars) < 300:
-        logger.warning("You have <300 bars - run the recorder longer for meaningful backtests.")
+        logger.warning("You have <300 bars - choose a smaller timeframe or extend history.")
 
-        strat = HTFTrendLTFEntryStrategy(
-            HTFTrendLTFEntryConfig(
-                htf_minutes=5,
-                htf_sma_period=10,
-                ltf_ema_period=10,
-                require_close_above_ema=True,
-                allow_shorts=True,
-                warmup_trend_mode="htf_candle",
-                warmup_min_htf_bars=2,
-                debug=True,
-            )
-)
-
+    # Demo strategy (still fine as a smoke test)
+    strat = HTFTrendLTFEntryStrategy(
+        HTFTrendLTFEntryConfig(
+            # With LTF=5m, HTF=60m is a nice pairing
+            htf_minutes=60,
+            htf_sma_period=50,
+            ltf_ema_period=50,
+            require_close_above_ema=True,
+            allow_shorts=True,
+            warmup_trend_mode="htf_candle",
+            warmup_min_htf_bars=5,
+            debug=False,
+        )
+    )
 
     engine = BacktestEngine(
         cfg=BacktestConfig(
@@ -59,12 +105,13 @@ def main() -> None:
         ),
     )
 
-    res = engine.run(bars, strat)
+    res = engine.run(bars, strat, venue=venue, symbol=symbol)
 
     print("")
     print("===== TBV8 BACKTEST RESULT =====")
-    print(f"Venue:        {res.venue}")
+    print(f"Data venue:   {venue}")
     print(f"Symbol:       {res.symbol}")
+    print(f"Timeframe:    {timeframe}")
     print(f"Start equity: ${res.starting_equity_usd:,.2f}")
     print(f"End equity:   ${res.ending_equity_usd:,.2f}")
     print(f"PnL:          ${res.total_pnl_usd:,.2f}")

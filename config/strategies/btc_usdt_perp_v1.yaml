@@ -1,13 +1,13 @@
-strategy_id: "btc_usdt_perp_v1"
-symbol: "BTC/USDT"
-timeframe: "1m"
+strategy_id: btc_usdt_perp_v1
+symbol: BTC/USDT
+timeframe: 5m
+
+routing:
+  primary: hyperliquid
+  secondary: mexc
+  mode: PRIMARY_LIVE_SECONDARY_SHADOW
 
 risk:
   max_position_btc: 0.01
-  max_daily_loss_usd: 10
-  max_leverage: 2
-
-routing:
-  primary: "mexc"
-  secondary: "hyperliquid"
-  mode: "PRIMARY_LIVE_SECONDARY_SHADOW" # later: PRIMARY_ONLY, BEST_EXECUTION
+  max_daily_loss_usd: 10.0
+  max_leverage: 2.0
