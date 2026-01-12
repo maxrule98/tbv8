@@ -4,12 +4,29 @@ from dataclasses import dataclass
 from typing import Any, List, Optional
 
 
-@dataclass
+@dataclass(frozen=True)
 class FillModel:
-    # taker fee rate (e.g. 0.0006 = 6 bps)
     taker_fee_rate: float = 0.0006
-    # slippage in basis points applied to fills (1.0 = 1bp = 0.01%)
-    slippage_bps: float = 1.0
+    slippage_bps: float = 0.0  # 1.0 = 1 basis point = 0.01%
+
+    def apply_slippage(self, price: float, side: int) -> float:
+        """
+        Apply slippage in the direction of the trade.
+
+        side: +1 buy, -1 sell
+        slippage_bps: basis points (1 bp = 0.01% = 0.0001)
+        """
+        if self.slippage_bps <= 0:
+            return float(price)
+
+        bps = float(self.slippage_bps) / 10_000.0
+
+        if side > 0:  # buy pays up
+            return float(price) * (1.0 + bps)
+        if side < 0:  # sell hits down
+            return float(price) * (1.0 - bps)
+
+        return float(price)
 
 
 @dataclass

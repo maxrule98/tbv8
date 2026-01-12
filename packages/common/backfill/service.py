@@ -14,6 +14,7 @@ from packages.common.backfill.sqlite_store import (
     CoverageRow,
     ensure_schema,
     get_max_ts,
+    get_min_max_ts,
     upsert_1m,
     upsert_coverage,
     upsert_agg,
@@ -58,10 +59,9 @@ class BackfillService:
         try:
             ensure_schema(conn)
 
-            max_ts = get_max_ts(conn, adapter.venue, spec.symbol, "1m")
+            max_ts_1m = get_max_ts(conn, adapter.venue, spec.symbol, "1m")
 
-            # Determine what we fetch
-            if max_ts is None:
+            if max_ts_1m is None:
                 fetch_start = start_ms
                 logger.info(
                     "History empty -> bootstrap 1m venue={} symbol={} [{}..{})",
@@ -71,16 +71,15 @@ class BackfillService:
                     end_ms,
                 )
             else:
-                fetch_start = max(max_ts + timeframe_to_ms("1m"), start_ms)
+                fetch_start = max(max_ts_1m + timeframe_to_ms("1m"), start_ms)
                 if fetch_start >= end_ms:
                     logger.info(
                         "History already up-to-date venue={} symbol={} max_ts={} end_ms={}",
                         adapter.venue,
                         spec.symbol,
-                        max_ts,
+                        max_ts_1m,
                         end_ms,
                     )
-                    # Still ensure aggregates exist/are refreshed over requested window
                     self._aggregate_all(conn, adapter.venue, spec.symbol, start_ms, end_ms, spec.timeframes)
                     conn.commit()
                     return
@@ -91,7 +90,7 @@ class BackfillService:
                     spec.symbol,
                     fetch_start,
                     end_ms,
-                    max_ts,
+                    max_ts_1m,
                 )
 
             await self._backfill_1m(conn, adapter, spec.symbol, fetch_start, end_ms)
@@ -108,11 +107,9 @@ class BackfillService:
                 ),
             )
 
-            # Aggregate efficiently:
-            # - bootstrap: full [start_ms..end_ms)
-            # - tail update: only from (fetch_start - max_tf_ms) to end_ms to rebuild boundary buckets
+            # dirty-window aggregation start
             agg_start = start_ms
-            if max_ts is not None:
+            if max_ts_1m is not None:
                 max_tf_ms = 0
                 for tf in spec.timeframes:
                     if tf != "1m":
@@ -186,14 +183,57 @@ class BackfillService:
         if not targets:
             return
 
-        base = load_1m_range(conn, venue, symbol, start_ms, end_ms)
-        if not base:
-            logger.warning("No 1m bars for venue={} symbol={} in [{}..{}) - cannot aggregate", venue, symbol, start_ms, end_ms)
-            return
+        start_ms = floor_ts_to_tf(int(start_ms), "1m")
+        end_ms = floor_ts_to_tf(int(end_ms), "1m")
 
         for tf in targets:
-            agg = aggregate_from_1m(base, timeframe=tf)
+            tf_ms = timeframe_to_ms(tf)
+
+            complete_end = floor_ts_to_tf(end_ms, tf)
+            if complete_end <= start_ms:
+                continue
+
+            tf_start = floor_ts_to_tf(start_ms, tf)
+
+            base = load_1m_range(conn, venue, symbol, tf_start, complete_end)
+            if not base:
+                logger.warning(
+                    "No 1m bars for venue={} symbol={} in [{}..{}) - cannot aggregate tf={}",
+                    venue,
+                    symbol,
+                    tf_start,
+                    complete_end,
+                    tf,
+                )
+                continue
+
+            agg = aggregate_from_1m(base, timeframe=tf, complete_end_ms=complete_end)
             if not agg:
                 continue
+
             upserted = upsert_agg(conn, tf, venue, symbol, agg)
-            logger.info("Aggregated 1m -> {} upserted={}", tf, upserted)
+
+            # ✅ Coverage comes from the actual materialized table contents
+            mm = get_min_max_ts(conn, venue, symbol, tf)
+            if mm is not None:
+                min_ts, max_ts = mm
+                upsert_coverage(
+                    conn,
+                    CoverageRow(
+                        venue=venue,
+                        symbol=symbol,
+                        timeframe=tf,
+                        start_ms=min_ts,
+                        end_ms=max_ts + tf_ms,
+                        updated_at_ms=now_ms(),
+                    ),
+                )
+                logger.info(
+                    "Aggregated 1m -> {} upserted={} coverage=[{}..{})",
+                    tf,
+                    upserted,
+                    min_ts,
+                    max_ts + tf_ms,
+                )
+            else:
+                logger.info("Aggregated 1m -> {} upserted={} (coverage unknown - empty table?)", tf, upserted)
