@@ -248,7 +248,7 @@ db_path: data/tbv8.sqlite
 history:
   market_data_venue: binance_spot
   start_date: "2017-08-17T00:00:00Z"
-  end_date: null  # null = NOW
+  end_date: null # null = NOW
 ```
 
 ### config/strategies/btc_usdt_perp_v1.yaml
@@ -372,7 +372,6 @@ touch packages/__init__.py
 touch packages/common/__init__.py
 touch packages/backtester/__init__.py
 touch packages/adapters/__init__.py
-touch packages/engine/__init__.py
 touch packages/market_data/__init__.py
 touch packages/runtime/__init__.py
 ```
@@ -393,7 +392,6 @@ Ensure all required configuration files exist:
 - `config/history.yaml`
 - `config/venues/*.yaml` (at least one venue configuration)
 - `config/strategies/*.yaml` (at least one strategy configuration)
-
 
 ## License
 

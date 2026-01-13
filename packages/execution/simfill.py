@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from packages.common.execution.fill_model import FillModel
-from packages.runtime.execution.types import Fill, OrderIntent
+from packages.execution.types import Fill, OrderIntent
 
 
 @dataclass(frozen=True)
