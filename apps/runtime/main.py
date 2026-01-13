@@ -60,7 +60,7 @@ async def _ensure_market_data(cfg) -> None:
     plant = MarketDataPlant(adapters=[BinanceSpotBackfillAdapter()])
 
     # Always ensure base 1m + the strategy tf
-    timeframes = ["1m", cfg.strategy.timeframe]
+    timeframes = ["1m", "5m", "15m", "1h", cfg.strategy.timeframe]
 
     await plant.ensure_history(
         EnsureHistoryRequest(

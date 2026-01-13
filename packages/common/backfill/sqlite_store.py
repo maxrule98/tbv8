@@ -176,3 +176,38 @@ def upsert_agg(conn: sqlite3.Connection, timeframe: str, venue: str, symbol: str
         )
         wrote += 1
     return wrote
+
+def get_max_complete_ts(conn: sqlite3.Connection, venue: str, symbol: str, timeframe: str) -> Optional[int]:
+    """
+    Return the max *completed* candle start ts for a timeframe.
+    - For 1m: scan ohlcv_1m (base table).
+    - For HTF: use history_coverage.end_ms (authoritative).
+    """
+    if timeframe == "1m":
+        return get_max_ts(conn, venue, symbol, timeframe)
+
+    cov = get_coverage(conn, venue, symbol, timeframe)
+    return cov.end_ms if cov else None
+
+def get_last_complete_open_ms(conn: sqlite3.Connection, venue: str, symbol: str, timeframe: str) -> Optional[int]:
+    cov = get_coverage(conn, venue, symbol, timeframe)
+    if not cov:
+        return None
+    tf_ms = timeframe_to_ms(timeframe)
+    # coverage end_ms is end-exclusive, so last complete candle open is end_ms - tf
+    return cov.end_ms - tf_ms
+
+
+def get_max_agg_open_ms(conn: sqlite3.Connection, venue: str, symbol: str, timeframe: str) -> Optional[int]:
+    # Used for diagnostics only - coverage is the source of truth.
+    table = f"bars_{timeframe}"
+    try:
+        row = conn.execute(
+            f"SELECT MAX(ts_ms) FROM {table} WHERE venue=? AND symbol=?",
+            (venue, symbol),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return None
+    if not row or row[0] is None:
+        return None
+    return int(row[0])

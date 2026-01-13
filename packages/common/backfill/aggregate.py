@@ -116,10 +116,21 @@ def aggregate_from_1m(bars: Sequence[OHLCV], *, timeframe: str, complete_end_ms:
             volume=b.volume,
         )
 
-    # If we ended while still inside a bucket that is < complete_end_ms,
-    # that bucket is complete *only if* we rolled into the next bucket at least once.
-    # For safety and determinism, we do NOT append the final in-progress state here.
-    # Completed candles are emitted on rollover only.
+    # Emit the final bucket if it is complete.
+    # A bucket starting at st_bucket is complete iff st_bucket + tf_ms <= complete_end_ms
+    if st is not None and st_bucket is not None:
+        tf_ms = timeframe_to_ms(timeframe)
+        if (st_bucket + tf_ms) <= complete_end_ms:
+            out.append(
+                OHLCV(
+                    ts_ms=st.ts_ms,
+                    open=st.open,
+                    high=st.high,
+                    low=st.low,
+                    close=st.close,
+                    volume=st.volume,
+                )
+            )
     return out
 
 

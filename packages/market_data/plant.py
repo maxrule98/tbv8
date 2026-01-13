@@ -15,6 +15,7 @@ from packages.common.backfill.sqlite_store import (
     ensure_schema,
     get_max_ts,
     upsert_coverage,
+    get_coverage,
 )
 from packages.common.backfill.service import BackfillService, BackfillSpec
 from packages.common.backfill.aggregate import build_aggregates
@@ -33,6 +34,13 @@ class MarketDataPlant:
     - Base backfill (1m)
     - Derived aggregation (5m, 15m, 1h, ...)
     - Coverage tracking for both base + derived
+
+    Coverage semantics (Option A):
+    - history_coverage.end_ms is EXCLUSIVE: [start_ms .. end_ms)
+    - For derived bars:
+        last_bar_open = max(ts_ms in bars_<tf>)
+        coverage_end_excl = last_bar_open + tf_ms
+      so coverage_end_excl - last_bar_open == tf_ms
     """
 
     def __init__(self, *, adapters: Sequence[BackfillAdapter], cfg: MarketDataPlantConfig | None = None):
@@ -48,6 +56,7 @@ class MarketDataPlant:
         tfs = [tf.strip() for tf in req.timeframes if tf and tf.strip()]
         if base_tf not in tfs:
             tfs = [base_tf, *tfs]
+
         # Deduplicate preserving order
         seen: set[str] = set()
         timeframes: list[str] = []
@@ -95,62 +104,92 @@ class MarketDataPlant:
         try:
             ensure_schema(conn)
 
-            # We always compute derived coverage as:
-            # [first_complete_bucket..last_complete_bucket] derived from base coverage.
             base_max_ts = get_max_ts(conn, req.venue, req.symbol, base_tf)
             if base_max_ts is None:
                 logger.warning("No base 1m data after ensure_history - cannot aggregate.")
                 return
 
-            # Derived bars can only be trusted up to the last *fully completed* bucket.
-            # If base_max_ts is 22:31, 5m last complete bucket is 22:25.
-            # Compute derived_end as floor(base_max_ts, tf) - tf_ms
-            # BUT: if base_max_ts is exactly on boundary and represents a completed 1m bar,
-            # floor gives bucket start; the last fully complete bucket is that bucket if we have all minutes.
-            # We keep it simple + conservative: derived_end_exclusive = floor(base_max_ts + 60_000, tf)
-            # and derived_end_inclusive_start = derived_end_exclusive - tf_ms.
             for tf in targets:
                 tf_ms = timeframe_to_ms(tf)
+                overlap_ms = tf_ms * 2  # deterministic safety overlap (cheap)
 
-                derived_start = floor_ts_to_tf(start_ms, tf)
-
+                # We only claim derived coverage for fully complete buckets.
+                #
+                # base_max_ts is last 1m candle open time.
+                # "latest complete" derived bucket ends at:
+                #   derived_end_excl = floor((base_max_ts + 1m), tf)
+                # and the last complete candle open is:
+                #   last_complete_open = derived_end_excl - tf_ms
                 derived_end_excl = floor_ts_to_tf(base_max_ts + timeframe_to_ms("1m"), tf)
-                derived_end = derived_end_excl - tf_ms
+                last_complete_open = derived_end_excl - tf_ms
 
-                if derived_end <= derived_start:
-                    logger.warning("Derived window too small for tf={} start={} end={}", tf, derived_start, derived_end)
+                # Read previous derived coverage (source of truth) - end_ms is EXCLUSIVE.
+                prev = get_coverage(conn, req.venue, req.symbol, tf)
+
+                # If no new completed bucket -> skip entirely
+                if prev and derived_end_excl <= prev.end_ms:
+                    logger.info(
+                        "No new completed buckets tf={} (prev_end_excl={} derived_end_excl={}) - skip",
+                        tf,
+                        prev.end_ms,
+                        derived_end_excl,
+                    )
                     continue
 
-                # Build aggregates from base in chunks.
+                # Incremental derived start:
+                # - first run: request start aligned to tf
+                # - later runs: start slightly before prev.end to be boundary-safe
+                req_start_tf = floor_ts_to_tf(start_ms, tf)
+                if prev:
+                    derived_start = floor_ts_to_tf(max(req_start_tf, prev.end_ms - overlap_ms), tf)
+                    cov_start = prev.start_ms  # never change established start
+                else:
+                    derived_start = req_start_tf
+                    cov_start = req_start_tf
+
+                # If window is too small to produce a completed candle, skip
+                if derived_end_excl <= derived_start:
+                    logger.info(
+                        "Derived window too small tf={} (start={} end_excl={}) - skip",
+                        tf,
+                        derived_start,
+                        derived_end_excl,
+                    )
+                    continue
+
+                # Build aggregates from base in chunks (build_aggregates uses [start..end))
                 build_aggregates(
                     conn,
                     venue=req.venue,
                     symbol=req.symbol,
                     start_ms=derived_start,
-                    end_ms=derived_end_excl,  # build_aggregates uses [start..end)
+                    end_ms=derived_end_excl,
                     timeframes=[tf],
                     chunk_days=req.chunk_days,
                 )
 
-                # Update derived coverage row
+                # Coverage end is EXCLUSIVE, so it should be last_complete_open + tf_ms == derived_end_excl
+                cov_end_excl = max(prev.end_ms, derived_end_excl) if prev else derived_end_excl
+
                 upsert_coverage(
                     conn,
                     CoverageRow(
                         venue=req.venue,
                         symbol=req.symbol,
                         timeframe=tf,
-                        start_ms=derived_start,
-                        end_ms=derived_end,
+                        start_ms=cov_start,
+                        end_ms=cov_end_excl,
                         updated_at_ms=now_ms(),
                     ),
                 )
                 conn.commit()
 
                 logger.info(
-                    "Derived coverage updated tf={} coverage=[{}..{}]",
+                    "Derived coverage updated tf={} coverage=[{}..{}) last_complete_open={}",
                     tf,
-                    derived_start,
-                    derived_end,
+                    cov_start,
+                    cov_end_excl,
+                    last_complete_open,
                 )
 
         finally:
