@@ -23,7 +23,7 @@ from packages.runtime.engine import RuntimeEngine, RuntimeEngineConfig
 from packages.runtime.execution.router import ExecutionRouter, RoutingPlan
 from packages.common.types import RoutingMode
 from packages.runtime.execution.simfill import SimFillExecutor
-from packages.runtime.sinks import FillModel
+from packages.common.execution.fill_model import FillModel
 
 from packages.backtester.strategies.htf_trend_ltf_entry import (
     HTFTrendLTFEntryConfig,

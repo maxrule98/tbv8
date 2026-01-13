@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from packages.backtester.engine import FillModel
+from packages.common.execution.fill_model import FillModel
 from packages.runtime.execution.types import Fill, OrderIntent
 
 
@@ -18,10 +18,9 @@ class SimFillExecutor:
     fill: FillModel
 
     def execute(self, price: float, intent: OrderIntent) -> Fill:
-        # Apply slippage in the direction of trade
-        px = self.fill.apply_slippage(price=price, side=int(intent.side))
+        px = self.fill.apply_slippage(price=float(price), side=int(intent.side))
         qty = float(intent.notional_usd) / float(px)
-        fee = float(intent.notional_usd) * float(self.fill.taker_fee_rate)
+        fee = self.fill.fee_usd(float(intent.notional_usd))
 
         return Fill(
             venue=self.venue,

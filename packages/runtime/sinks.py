@@ -3,21 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional
 
+from packages.common.execution.fill_model import FillModel
 from packages.runtime.ports import ExecutionEvent, RuntimeResult
-
-
-@dataclass(frozen=True)
-class FillModel:
-    taker_fee_rate: float = 0.0006     # 6 bps
-    slippage_bps: float = 1.0          # 1 bp
-
-    def slip_price(self, px: float, side: int) -> float:
-        # side: +1 buy (pay up), -1 sell (hit down)
-        slip = self.slippage_bps / 10_000.0
-        return px * (1.0 + slip) if side > 0 else px * (1.0 - slip)
-
-    def fee_usd(self, notional_usd: float) -> float:
-        return notional_usd * self.taker_fee_rate
 
 
 @dataclass
@@ -49,8 +36,6 @@ class SimFillSink:
         if target == self._pos:
             return
 
-        # We always “close then open” at the same timestamp price for now.
-        # This is fine for deterministic functionality; later we can model queueing/partial fills.
         # Exit existing
         if self._pos != 0:
             side = -self._pos  # to flatten
@@ -64,39 +49,34 @@ class SimFillSink:
         self._pos = target
 
     def _execute(self, ts_ms: int, side: int, price: float, reason: str) -> None:
-        px = self.fill.slip_price(price, side)
+        px = self.fill.apply_slippage(price=float(price), side=int(side))
         notional = float(self.notional_per_trade_usd)
-        qty = notional / px
+        qty = notional / float(px)
         fee = self.fill.fee_usd(notional)
 
-        # crude PnL accounting:
-        # We treat each trade as consuming fee and the rest is mark-to-market handled implicitly by target model.
-        # For now (functionality-first), equity just subtracts fees; PnL is computed at finalize using price deltas
-        # is out of scope until we add proper position bookkeeping.
         self._equity -= fee
         self._fees += fee
 
         self._trades.append(
             ExecutionEvent(
-                ts_ms=ts_ms,
-                side=side,
-                qty=qty,
-                price=px,
-                fee_usd=fee,
-                reason=reason,
+                ts_ms=int(ts_ms),
+                side=int(side),
+                qty=float(qty),
+                price=float(px),
+                fee_usd=float(fee),
+                reason=str(reason),
             )
         )
 
     def finalize(self) -> RuntimeResult:
-        # For now, total_pnl is equity - starting (fees already applied)
-        end_equity = self._equity
+        end_equity = float(self._equity)
         pnl = end_equity - float(self.starting_equity_usd)
         return RuntimeResult(
             venue=self.venue,
             symbol=self.symbol,
             starting_equity_usd=float(self.starting_equity_usd),
             ending_equity_usd=end_equity,
-            total_pnl_usd=pnl,
-            total_fees_usd=self._fees,
+            total_pnl_usd=float(pnl),
+            total_fees_usd=float(self._fees),
             trades=list(self._trades),
         )
