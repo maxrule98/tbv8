@@ -1,55 +1,86 @@
-# TBV8 (NautilusTrader-based) - Dev README
+# TBV8 - Multi-Venue Trading System
 
-TBV8 is a multi-venue trading system with:
+[![Python](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
+[![NautilusTrader](https://img.shields.io/badge/NautilusTrader-1.222+-green.svg)](https://nautilustrader.io/)
+[![uv](https://img.shields.io/badge/uv-package%20manager-purple.svg)](https://github.com/astral-sh/uv)
 
-- Live market data recording (Hyperliquid + MEXC)
-- Historical backfill (Binance Spot as research/backtest feed)
-- Local aggregation (1m -> 5m/15m/1h/4h/etc) into SQLite
-- A simple backtester that reads bars from SQLite
+TBV8 is a multi-venue trading system built on NautilusTrader with comprehensive market data management and backtesting capabilities.
 
-This README focuses on **runnable commands**.
+## Features
 
----
-
-## Prereqs
-
-- Python managed via `uv`
-- Repo venv created (whatever you already did to get `uv run` working)
-- Config files present:
-  - `config/venues/*.yaml` (execution / live venues - e.g. hyperliquid, mexc)
-  - `config/strategies/*.yaml` (strategy runtime config - symbol/timeframe/routing/risk)
-  - `config/history.yaml` (backtest/backfill market-data venue + date range)
-  - `config/data.yaml` (SQLite path)
+- **Live Market Data Recording** - Real-time data capture from Hyperliquid and MEXC
+- **Historical Backfill** - Binance Spot data for research and backtesting
+- **Local Aggregation** - Automatic timeframe conversion (1m → 5m/15m/1h/4h/etc) stored in SQLite
+- **Backtesting Engine** - Replay historical bars from SQLite for strategy validation
 
 ---
 
-## Quick start
+## Table of Contents
 
-### 1) Run the live recorder (writes trades/bbo and live bars_1m)
+- [Prerequisites](#prerequisites)
+- [Quick Start](#quick-start)
+- [Commands](#commands)
+  - [Recorder](#recorder)
+  - [Backfiller](#backfiller)
+  - [Aggregator](#aggregator)
+  - [Backtester](#backtester)
+  - [Database Inspection](#database-inspection)
+- [Configuration](#configuration)
+- [Typical Workflows](#typical-workflows)
+- [Repository Structure](#repository-structure)
+- [Troubleshooting](#troubleshooting)
+
+---
+
+## Prerequisites
+
+Before running TBV8, ensure you have:
+
+- **Python 3.12+** managed via [uv](https://github.com/astral-sh/uv)
+- **Repository venv** created (should be ready if `uv run` works)
+- **Configuration files** present:
+  - `config/venues/*.yaml` - Execution/live venues (e.g., Hyperliquid, MEXC)
+  - `config/strategies/*.yaml` - Strategy runtime config (symbol/timeframe/routing/risk)
+  - `config/history.yaml` - Backtest/backfill market data venue and date range
+  - `config/data.yaml` - SQLite database path
+
+---
+
+## Quick Start
+
+### 1. Run the Live Recorder
+
+Records trades, BBO (best bid/offer), and live 1-minute bars:
 
 ```bash
 uv run python -m apps.recorder.main
 ```
 
-Stop with Ctrl+C.
+Stop with `Ctrl+C`.
 
-2. Backfill historical 1m data (Binance Spot -> ohlcv_1m)
+### 2. Backfill Historical Data
+
+Populates SQLite with historical 1-minute candles (e.g., BTC/USDT from 2017-08-17 to present):
 
 ```bash
 uv run python -m apps.backfiller.main
 ```
 
-This will populate SQLite with historical 1m candles (example: BTC/USDT from 2017-08-17 to now).
+### 3. Aggregate Timeframes
 
-3. Aggregate 1m -> higher timeframes (writes bars_5m, bars_1h, etc.)
-
-Example:
+Converts 1-minute data to higher timeframes (5m, 15m, 1h, 4h, etc.):
 
 ```bash
-uv run python -m apps.aggregator.main --venue binance_spot --symbol BTC/USDT --timeframes 5m,15m,1h,4h --chunk-days 7
+uv run python -m apps.aggregator.main \
+  --venue binance_spot \
+  --symbol BTC/USDT \
+  --timeframes 5m,15m,1h,4h \
+  --chunk-days 7
 ```
 
-4. Run a backtest (reads bars\_{timeframe} from SQLite)
+### 4. Run a Backtest
+
+Reads bars from SQLite and executes your strategy:
 
 ```bash
 uv run python -m apps.backtester.main
@@ -57,227 +88,317 @@ uv run python -m apps.backtester.main
 
 ---
 
-## Common CLI commands
+## Commands
 
 ### Recorder
 
-Run:
+Connects to enabled WebSocket data clients and records live market data.
+
+**Command:**
 
 ```bash
 uv run python -m apps.recorder.main
 ```
 
-Expected behavior:
+**What it does:**
 
-- Connects to enabled WS data clients (e.g. hyperliquid + mexc)
-- Writes:
-- trades
-- bbo
-- bars_1m (live aggregated bars)
+- Connects to enabled WS data clients (e.g., Hyperliquid + MEXC)
+- Writes to SQLite:
+  - `trades` - Individual trade executions
+  - `bbo` - Best bid/offer snapshots
+  - `bars_1m` - Live aggregated 1-minute bars
 
 ---
 
-### Backfiller (historical 1m)
+### Backfiller
 
-Run:
+Fetches historical 1-minute OHLCV data for backtesting.
+
+**Command:**
 
 ```bash
 uv run python -m apps.backfiller.main
 ```
 
-Expected behavior:
+**What it does:**
 
-- Uses config/history.yaml to decide:
-- market_data_venue (e.g. binance_spot)
-- start_date / end_date (or end=NOW)
-- Writes:
-- ohlcv_1m
-- history_coverage
+- Reads configuration from `config/history.yaml`:
+  - `market_data_venue` (e.g., `binance_spot`)
+  - `start_date` / `end_date` (or end=NOW)
+- Writes to SQLite:
+  - `ohlcv_1m` - Historical 1-minute candles
+  - `history_coverage` - Coverage tracking
 
 ---
 
-### Aggregator (1m -> N timeframes)
+### Aggregator
 
-Run:
+Aggregates 1-minute bars into higher timeframes.
 
-```bash
-uv run python -m apps.aggregator.main --venue <venue> --symbol <symbol> --timeframes <csv> --chunk-days <n>
-```
-
-Example:
+**Command:**
 
 ```bash
-uv run python -m apps.aggregator.main --venue binance_spot --symbol BTC/USDT --timeframes 5m,15m,1h,4h --chunk-days 7
+uv run python -m apps.aggregator.main \
+  --venue <venue> \
+  --symbol <symbol> \
+  --timeframes <csv> \
+  --chunk-days <n>
 ```
 
-Writes:
+**Example:**
 
-- bars_5m
-- bars_15m
-- bars_1h
-- bars_4h
-- (and any other requested TFs)
+```bash
+uv run python -m apps.aggregator.main \
+  --venue binance_spot \
+  --symbol BTC/USDT \
+  --timeframes 5m,15m,1h,4h \
+  --chunk-days 7
+```
+
+**What it writes:**
+
+- `bars_5m` - 5-minute bars
+- `bars_15m` - 15-minute bars
+- `bars_1h` - 1-hour bars
+- `bars_4h` - 4-hour bars
+- (Any other requested timeframes)
 
 ---
 
 ### Backtester
 
-Run:
+Runs strategy backtests using historical bar data.
+
+**Command:**
 
 ```bash
 uv run python -m apps.backtester.main
 ```
 
-Expected behavior:
+**What it does:**
 
-- Loads strategy config (config/strategies/...)
+- Loads strategy configuration from `config/strategies/...`
 - Loads backtest bars from SQLite using:
-- venue = cfg.history.market_data_venue (e.g. binance_spot)
-- symbol = cfg.strategy.symbol (e.g. BTC/USDT)
-- timeframe = cfg.strategy.timeframe (e.g. 5m)
-- start/end from cfg.history.start_date / cfg.history.end_date
+  - `venue` = `config.history.market_data_venue` (e.g., `binance_spot`)
+  - `symbol` = `config.strategy.symbol` (e.g., `BTC/USDT`)
+  - `timeframe` = `config.strategy.timeframe` (e.g., `5m`)
+  - `start`/`end` from `config.history.start_date` / `config.history.end_date`
 
 ---
 
-### Database (SQLite) - inspection commands
+### Database Inspection
 
-List tables:
+Useful SQLite commands for inspecting your data.
+
+**List all tables:**
 
 ```bash
 sqlite3 data/tbv8.sqlite ".tables"
 ```
 
-Check row counts:
+**Check row counts:**
 
 ```bash
-sqlite3 data/tbv8.sqlite "select count(_) from ohlcv_1m;"
-sqlite3 data/tbv8.sqlite "select count(_) from bars*1m;"
-sqlite3 data/tbv8.sqlite "select count(*) from bars*5m;"
-sqlite3 data/tbv8.sqlite "select count(*) from bars_1h;"
+sqlite3 data/tbv8.sqlite "SELECT COUNT(*) FROM ohlcv_1m;"
+sqlite3 data/tbv8.sqlite "SELECT COUNT(*) FROM bars_1m;"
+sqlite3 data/tbv8.sqlite "SELECT COUNT(*) FROM bars_5m;"
+sqlite3 data/tbv8.sqlite "SELECT COUNT(*) FROM bars_1h;"
 ```
 
-Verify historical coverage for Binance spot backfill:
+**Verify historical coverage:**
 
 ```bash
 sqlite3 data/tbv8.sqlite "
-select
-min(datetime(ts_ms/1000,'unixepoch')),
-max(datetime(ts_ms/1000,'unixepoch')),
-count(\*)
-from ohlcv_1m
-where venue='binance_spot' and symbol='BTC/USDT';
+SELECT
+  MIN(datetime(ts_ms/1000, 'unixepoch')) as first_bar,
+  MAX(datetime(ts_ms/1000, 'unixepoch')) as last_bar,
+  COUNT(*) as total_bars
+FROM ohlcv_1m
+WHERE venue='binance_spot' AND symbol='BTC/USDT';
 "
 ```
 
-Latest bar timestamps per venue:
+**Latest bar timestamps per venue:**
 
 ```bash
 sqlite3 data/tbv8.sqlite "
-select venue, max(datetime(ts_ms/1000,'unixepoch')) as last_bar_time, count(\*)
-from bars_1m
-where symbol='BTC/USDT'
-group by venue;
+SELECT
+  venue,
+  MAX(datetime(ts_ms/1000, 'unixepoch')) as last_bar_time,
+  COUNT(*) as total_bars
+FROM bars_1m
+WHERE symbol='BTC/USDT'
+GROUP BY venue;
 "
 ```
 
 ---
 
-### Config reference (what matters for running commands)
+## Configuration
 
-config/data.yaml
+### config/data.yaml
 
+```yaml
 db_path: data/tbv8.sqlite
+```
 
-config/history.yaml
+### config/history.yaml
 
+```yaml
 history:
-market_data_venue: binance_spot
-start_date: "2017-08-17T00:00:00Z"
-end_date: null
+  market_data_venue: binance_spot
+  start_date: "2017-08-17T00:00:00Z"
+  end_date: null  # null = NOW
+```
 
-config/strategies/btc_usdt_perp_v1.yaml (example shape)
+### config/strategies/btc_usdt_perp_v1.yaml
 
+Example strategy configuration:
+
+```yaml
 strategy_id: btc_usdt_perp_v1
 symbol: BTC/USDT
 timeframe: 5m
 
 routing:
-primary: hyperliquid
-secondary: mexc
-mode: PRIMARY_LIVE_SECONDARY_SHADOW
+  primary: hyperliquid
+  secondary: mexc
+  mode: PRIMARY_LIVE_SECONDARY_SHADOW
 
 risk:
-max_position_btc: 0.01
-max_daily_loss_usd: 10.0
-max_leverage: 2.0
+  max_position_btc: 0.01
+  max_daily_loss_usd: 10.0
+  max_leverage: 2.0
+```
 
-Notes:
+**Notes:**
 
-- routing.\* is for execution / live routing.
-- Backtests use history.market_data_venue for data (e.g. binance_spot).
+- `routing.*` settings are for execution/live routing
+- Backtests use `history.market_data_venue` for data (e.g., `binance_spot`)
 
 ---
 
-## Troubleshooting
+## Typical Workflows
 
-Use:
+### Workflow 1: Backtest on Historical Data
 
-```bash
-uv run python
-```
-
-Always run python commands through uv:
-
-```bash
-uv run python -m <module>
-```
-
-Module import errors (No module named 'apps...' / packages...)
-
-Make sure these exist:
-
-```bash
-touch apps/**init**.py
-touch apps/backtester/**init**.py
-touch packages/**init**.py
-touch packages/backtester/**init**.py
-```
-
----
-
-## Typical workflows
-
-Live-record a bit, then backtest on long history 1. Backfill 1m (once):
+1. **Backfill 1-minute data** (one-time setup):
 
 ```bash
 uv run python -m apps.backfiller.main
 ```
 
-2. Aggregate timeframes:
+2. **Aggregate to desired timeframes**:
 
 ```bash
-uv run python -m apps.aggregator.main --venue binance_spot --symbol BTC/USDT --timeframes 5m,15m,1h,4h --chunk-days 7
+uv run python -m apps.aggregator.main \
+  --venue binance_spot \
+  --symbol BTC/USDT \
+  --timeframes 5m,15m,1h,4h \
+  --chunk-days 7
 ```
 
-3. Backtest:
+3. **Run backtest**:
 
 ```bash
 uv run python -m apps.backtester.main
 ```
 
-Live market data recording (perps venues)
+### Workflow 2: Live Market Data Recording
+
+Record real-time data from perpetual futures venues:
 
 ```bash
 uv run python -m apps.recorder.main
 ```
 
+This continuously records trades, BBO, and 1-minute bars until stopped with `Ctrl+C`.
+
 ---
 
-Repo map (high level)
+## Repository Structure
 
-- apps/recorder/ - live WS recorder -> SQLite
-- apps/backfiller/ - historical fetcher -> ohlcv\*1m
-- apps/aggregator/ - local aggregation -> bars\*{tf}
-- apps/backtester/ - backtest runner
-- packages/common/ - config + backfill / aggregation / store helpers
-- packages/backtester/ - backtest engine, db loader, strategies
+```
+tbv8/
+├── apps/
+│   ├── recorder/       # Live WebSocket recorder → SQLite
+│   ├── backfiller/     # Historical fetcher → ohlcv_1m
+│   ├── aggregator/     # Local aggregation → bars_{tf}
+│   └── backtester/     # Backtest runner
+├── packages/
+│   ├── common/         # Config, backfill, aggregation, storage helpers
+│   ├── backtester/     # Backtest engine, DB loader, strategies
+│   ├── adapters/       # Exchange adapters
+│   ├── engine/         # Trading engine components
+│   ├── market_data/    # Market data handling
+│   └── runtime/        # Runtime utilities
+├── config/
+│   ├── data.yaml       # Database configuration
+│   ├── history.yaml    # Historical data configuration
+│   ├── venues/         # Exchange venue configurations
+│   └── strategies/     # Strategy configurations
+└── main.py             # Entry point
+```
+
+---
+
+## Troubleshooting
+
+### Running Python Commands
+
+Always use `uv` to run Python commands:
+
+```bash
+uv run python -m <module>
+```
+
+For the Python REPL:
+
+```bash
+uv run python
+```
+
+### Module Import Errors
+
+If you encounter errors like `No module named 'apps...'` or `No module named 'packages...'`, ensure all `__init__.py` files exist:
+
+```bash
+touch apps/__init__.py
+touch apps/backfiller/__init__.py
+touch apps/recorder/__init__.py
+touch apps/aggregator/__init__.py
+touch apps/backtester/__init__.py
+touch packages/__init__.py
+touch packages/common/__init__.py
+touch packages/backtester/__init__.py
+touch packages/adapters/__init__.py
+touch packages/engine/__init__.py
+touch packages/market_data/__init__.py
+touch packages/runtime/__init__.py
+```
+
+### Database Issues
+
+If you encounter database-related errors, verify:
+
+1. The database path in `config/data.yaml` is correct
+2. The `data/` directory exists and is writable
+3. SQLite is installed and accessible
+
+### Configuration Issues
+
+Ensure all required configuration files exist:
+
+- `config/data.yaml`
+- `config/history.yaml`
+- `config/venues/*.yaml` (at least one venue configuration)
+- `config/strategies/*.yaml` (at least one strategy configuration)
+
+
+## License
+
+This project is for educational and research purposes.
+
+## Contributing
+
+This is a personal project. For questions or issues, please open a GitHub issue.
