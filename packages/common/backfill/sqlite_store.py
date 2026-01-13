@@ -47,52 +47,58 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
         );
         """
     )
-
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_ohlcv_1m_vs ON ohlcv_1m(venue, symbol, ts_ms);")
     conn.commit()
 
 
-def _table_for_tf(timeframe: str) -> str:
-    return "ohlcv_1m" if timeframe == "1m" else f"bars_{timeframe}"
+def get_min_max_ts(conn: sqlite3.Connection, venue: str, symbol: str, timeframe: str) -> Tuple[Optional[int], Optional[int]]:
+    """
+    Return (min_ts_ms, max_ts_ms) for a stored timeframe.
 
+    We only guarantee this for the 1m base table today.
+    Aggregates are derived and should be tracked via history_coverage, not by scanning.
+    """
+    if timeframe != "1m":
+        return (None, None)
 
-def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
     row = conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
-        (table,),
+        "SELECT MIN(ts_ms), MAX(ts_ms) FROM ohlcv_1m WHERE venue=? AND symbol=?",
+        (venue, symbol),
     ).fetchone()
-    return bool(row)
+
+    if not row:
+        return (None, None)
+
+    min_ts = row[0]
+    max_ts = row[1]
+    return (int(min_ts) if min_ts is not None else None, int(max_ts) if max_ts is not None else None)
 
 
 def get_max_ts(conn: sqlite3.Connection, venue: str, symbol: str, timeframe: str) -> Optional[int]:
-    table = _table_for_tf(timeframe)
-    if not _table_exists(conn, table):
-        return None
+    _min_ts, max_ts = get_min_max_ts(conn, venue, symbol, timeframe)
+    return max_ts
 
+
+def get_coverage(conn: sqlite3.Connection, venue: str, symbol: str, timeframe: str) -> Optional[CoverageRow]:
     row = conn.execute(
-        f"SELECT MAX(ts_ms) FROM {table} WHERE venue=? AND symbol=?",
-        (venue, symbol),
-    ).fetchone()
-    return row[0] if row and row[0] is not None else None
-
-
-def get_min_max_ts(conn: sqlite3.Connection, venue: str, symbol: str, timeframe: str) -> Optional[Tuple[int, int]]:
-    """
-    Returns (min_ts_ms, max_ts_ms) for the given timeframe table.
-    """
-    table = _table_for_tf(timeframe)
-    if not _table_exists(conn, table):
-        return None
-
-    row = conn.execute(
-        f"SELECT MIN(ts_ms), MAX(ts_ms) FROM {table} WHERE venue=? AND symbol=?",
-        (venue, symbol),
+        """
+        SELECT venue, symbol, timeframe, start_ms, end_ms, updated_at_ms
+        FROM history_coverage
+        WHERE venue=? AND symbol=? AND timeframe=?
+        """,
+        (venue, symbol, timeframe),
     ).fetchone()
 
-    if not row or row[0] is None or row[1] is None:
+    if not row:
         return None
 
-    return (int(row[0]), int(row[1]))
+    return CoverageRow(
+        venue=str(row[0]),
+        symbol=str(row[1]),
+        timeframe=str(row[2]),
+        start_ms=int(row[3]),
+        end_ms=int(row[4]),
+        updated_at_ms=int(row[5]),
+    )
 
 
 def upsert_coverage(conn: sqlite3.Connection, row: CoverageRow) -> None:
@@ -147,13 +153,11 @@ def ensure_agg_table(conn: sqlite3.Connection, timeframe: str) -> None:
         );
         """
     )
-    conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{table}_vs ON {table}(venue, symbol, ts_ms);")
 
 
 def upsert_agg(conn: sqlite3.Connection, timeframe: str, venue: str, symbol: str, rows: Iterable[OHLCV]) -> int:
     ensure_agg_table(conn, timeframe)
     table = f"bars_{timeframe}"
-
     cur = conn.cursor()
     wrote = 0
     for r in rows:
