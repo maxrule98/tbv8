@@ -4,6 +4,8 @@ import sqlite3
 from dataclasses import dataclass
 from typing import Iterable, Optional, Tuple
 
+from packages.common.timeframes import timeframe_to_ms
+from packages.common.constants import BASE_TIMEFRAME
 from packages.common.backfill.types import OHLCV
 
 
@@ -57,7 +59,7 @@ def get_min_max_ts(conn: sqlite3.Connection, venue: str, symbol: str, timeframe:
     We only guarantee this for the 1m base table today.
     Aggregates are derived and should be tracked via history_coverage, not by scanning.
     """
-    if timeframe != "1m":
+    if timeframe != BASE_TIMEFRAME:
         return (None, None)
 
     row = conn.execute(
@@ -153,6 +155,13 @@ def ensure_agg_table(conn: sqlite3.Connection, timeframe: str) -> None:
         );
         """
     )
+    conn.execute(
+        f"""
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_{table}_vst
+          ON {table} (venue, symbol, ts_ms);
+        """
+    )
+    conn.commit()
 
 
 def upsert_agg(conn: sqlite3.Connection, timeframe: str, venue: str, symbol: str, rows: Iterable[OHLCV]) -> int:
@@ -180,7 +189,7 @@ def upsert_agg(conn: sqlite3.Connection, timeframe: str, venue: str, symbol: str
 def get_max_complete_ts(conn: sqlite3.Connection, venue: str, symbol: str, timeframe: str) -> Optional[int]:
     """
     Return the max *completed* candle start ts for a timeframe.
-    - For 1m: scan ohlcv_1m (base table).
+    - For 1m: scan oBASE_TIMEFRAME_1m (base table).
     - For HTF: use history_coverage.end_ms (authoritative).
     """
     if timeframe == "1m":
@@ -211,3 +220,45 @@ def get_max_agg_open_ms(conn: sqlite3.Connection, venue: str, symbol: str, timef
     if not row or row[0] is None:
         return None
     return int(row[0])
+
+
+def resolve_bar_window_from_coverage(
+    *,
+    db_path: str,
+    venue: str,
+    symbol: str,
+    timeframe: str,
+    requested_start_ms: Optional[int],
+    requested_end_ms: Optional[int],
+) -> Tuple[int, int]:
+    """
+    Returns [start_ms, end_ms_exclusive) for loading bars from coverage.
+
+    Coverage semantics:
+      coverage.start_ms is INCLUSIVE
+      coverage.end_ms is EXCLUSIVE (== last_complete_bar_open + tf_ms)
+    """
+    conn = sqlite3.connect(db_path)
+    try:
+        ensure_schema(conn)
+        cov = get_coverage(conn, venue, symbol, timeframe)
+        if cov is None:
+            raise RuntimeError(f"No coverage for venue={venue} symbol={symbol} tf={timeframe}. Run backfiller first.")
+
+        # Invariant: cov.end_ms is EXCLUSIVE
+        cov_start = cov.start_ms
+        cov_end_excl = cov.end_ms
+
+        start_ms = max(cov_start, requested_start_ms) if requested_start_ms is not None else cov_start
+        end_ms_excl = min(cov_end_excl, requested_end_ms) if requested_end_ms is not None else cov_end_excl
+
+        if end_ms_excl <= start_ms:
+            # This can happen if requested range is outside coverage, or coverage is empty/malformed
+            raise RuntimeError(
+                f"Resolved empty bar window start={start_ms} end_excl={end_ms_excl} "
+                f"(coverage=[{cov_start}..{cov_end_excl}) requested=[{requested_start_ms}..{requested_end_ms}))"
+            )
+
+        return start_ms, end_ms_excl
+    finally:
+        conn.close()

@@ -8,6 +8,7 @@ from loguru import logger
 
 from packages.common.datetime_utils import now_ms, parse_iso8601_to_ms
 from packages.common.timeframes import floor_ts_to_tf, timeframe_to_ms
+from packages.common.constants import BASE_TIMEFRAME, BASE_TF_MS
 
 from packages.common.backfill.types import BackfillAdapter
 from packages.common.backfill.sqlite_store import (
@@ -45,11 +46,11 @@ class BackfillService:
     async def ensure_history(self, spec: BackfillSpec) -> None:
         adapter = self._adapter(spec.venue)
 
-        start_ms = floor_ts_to_tf(parse_iso8601_to_ms(spec.start_date), "1m")
+        start_ms = floor_ts_to_tf(parse_iso8601_to_ms(spec.start_date), BASE_TIMEFRAME)
         end_ms = (
-            floor_ts_to_tf(parse_iso8601_to_ms(spec.end_date), "1m")
+            floor_ts_to_tf(parse_iso8601_to_ms(spec.end_date), BASE_TIMEFRAME)
             if spec.end_date
-            else floor_ts_to_tf(now_ms(), "1m")
+            else floor_ts_to_tf(now_ms(), BASE_TIMEFRAME)
         )
 
         if end_ms <= start_ms:
@@ -59,7 +60,7 @@ class BackfillService:
         try:
             ensure_schema(conn)
 
-            max_ts_1m = get_max_ts(conn, adapter.venue, spec.symbol, "1m")
+            max_ts_1m = get_max_ts(conn, adapter.venue, spec.symbol, BASE_TIMEFRAME)
 
             if max_ts_1m is None:
                 fetch_start = start_ms
@@ -71,7 +72,7 @@ class BackfillService:
                     end_ms,
                 )
             else:
-                fetch_start = max(max_ts_1m + timeframe_to_ms("1m"), start_ms)
+                fetch_start = max(max_ts_1m + BASE_TF_MS, start_ms)
                 if fetch_start >= end_ms:
                     logger.info(
                         "History already up-to-date venue={} symbol={} max_ts={} end_ms={}",
@@ -100,7 +101,7 @@ class BackfillService:
                 CoverageRow(
                     venue=adapter.venue,
                     symbol=spec.symbol,
-                    timeframe="1m",
+                    timeframe=BASE_TIMEFRAME,
                     start_ms=start_ms,
                     end_ms=end_ms,
                     updated_at_ms=now_ms(),
@@ -112,7 +113,7 @@ class BackfillService:
             if max_ts_1m is not None:
                 max_tf_ms = 0
                 for tf in spec.timeframes:
-                    if tf != "1m":
+                    if tf != BASE_TIMEFRAME:
                         max_tf_ms = max(max_tf_ms, timeframe_to_ms(tf))
                 if max_tf_ms > 0:
                     agg_start = max(start_ms, fetch_start - max_tf_ms)
@@ -133,7 +134,7 @@ class BackfillService:
         start_ms: int,
         end_ms: int,
     ) -> None:
-        tf_ms = timeframe_to_ms("1m")
+        tf_ms = BASE_TF_MS
         cursor = int(start_ms)
         pages = 0
         total_rows = 0
@@ -141,7 +142,7 @@ class BackfillService:
         while cursor < end_ms:
             rows = await adapter.fetch_ohlcv(
                 symbol=symbol,
-                timeframe="1m",
+                timeframe=BASE_TIMEFRAME,
                 start_ms=cursor,
                 end_ms=end_ms,
                 limit=1000,
@@ -157,7 +158,7 @@ class BackfillService:
             pages += 1
             total_rows += wrote
 
-            last_ts = floor_ts_to_tf(rows[-1].ts_ms, "1m")
+            last_ts = floor_ts_to_tf(rows[-1].ts_ms, BASE_TIMEFRAME)
             next_cursor = last_ts + tf_ms
             if next_cursor <= cursor:
                 logger.warning("Backfill cursor did not advance (cursor={} last_ts={}) - stopping", cursor, last_ts)
@@ -179,12 +180,12 @@ class BackfillService:
         end_ms: int,
         timeframes: Sequence[str],
     ) -> None:
-        targets = [tf for tf in timeframes if tf != "1m"]
+        targets = [tf for tf in timeframes if tf != BASE_TIMEFRAME]
         if not targets:
             return
 
-        start_ms = floor_ts_to_tf(int(start_ms), "1m")
-        end_ms = floor_ts_to_tf(int(end_ms), "1m")
+        start_ms = floor_ts_to_tf(int(start_ms), BASE_TIMEFRAME)
+        end_ms = floor_ts_to_tf(int(end_ms), BASE_TIMEFRAME)
 
         for tf in targets:
             tf_ms = timeframe_to_ms(tf)

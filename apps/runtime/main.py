@@ -10,7 +10,11 @@ from loguru import logger
 
 from packages.common.config import load_tbv8_config
 from packages.common.timeframes import timeframe_to_ms
-from packages.common.backfill.sqlite_store import get_coverage, ensure_schema
+from packages.common.backfill.sqlite_store import (
+    get_coverage, 
+    ensure_schema, 
+    resolve_bar_window_from_coverage
+)
 
 from packages.market_data.plant import MarketDataPlant
 from packages.market_data.types import EnsureHistoryRequest
@@ -75,48 +79,8 @@ async def _ensure_market_data(cfg) -> None:
     )
 
 
-def _resolve_bar_window_from_coverage(
-    *,
-    db_path: str,
-    venue: str,
-    symbol: str,
-    timeframe: str,
-    requested_start_ms: Optional[int],
-    requested_end_ms: Optional[int],
-) -> tuple[int, int]:
-    """
-    Returns [start_ms, end_ms_exclusive) for loading bars.
-    We use coverage.end_ms as the last COMPLETE candle start.
-    """
-    tf_ms = timeframe_to_ms(timeframe)
 
-    conn = sqlite3.connect(db_path)
-    try:
-        ensure_schema(conn)
-        cov = get_coverage(conn, venue, symbol, timeframe)
-        if cov is None:
-            raise RuntimeError(f"No coverage for venue={venue} symbol={symbol} tf={timeframe}. Run backfiller first.")
-
-        cov_start = cov.start_ms
-        cov_end_inclusive = cov.end_ms
-        cov_end_excl = cov_end_inclusive + tf_ms
-
-        start_ms = max(cov_start, requested_start_ms) if requested_start_ms is not None else cov_start
-        end_ms_excl = min(cov_end_excl, requested_end_ms) if requested_end_ms is not None else cov_end_excl
-
-        if end_ms_excl <= start_ms:
-            raise RuntimeError(
-                f"Resolved empty bar window start={start_ms} end_excl={end_ms_excl} "
-                f"(coverage=[{cov_start}..{cov_end_inclusive}])"
-            )
-
-        return start_ms, end_ms_excl
-    finally:
-        conn.close()
-
-
-async def main_async() -> None:
-    cfg = load_tbv8_config()
+async def run_simfill_backtest(cfg) -> None:
     venue = cfg.history.market_data_venue
     symbol = cfg.strategy.symbol
     timeframe = cfg.strategy.timeframe
@@ -128,7 +92,7 @@ async def main_async() -> None:
     requested_start_ms = _maybe_ms(cfg.history.start_date)
     requested_end_ms = _maybe_ms(cfg.history.end_date)  # often None
 
-    start_ms, end_ms_excl = _resolve_bar_window_from_coverage(
+    start_ms, end_ms_excl = resolve_bar_window_from_coverage(
         db_path=str(cfg.data.db_path),
         venue=venue,
         symbol=symbol,
@@ -140,7 +104,7 @@ async def main_async() -> None:
     # 3) Load bars
     bars = load_bars(
         LoadBarsQuery(
-            db_path=DB_PATH,
+            db_path=str(cfg.data.db_path),
             venue=venue,
             symbol=symbol,
             timeframe=timeframe,
@@ -221,6 +185,11 @@ async def main_async() -> None:
         for t in last:
             side = "BUY" if t.side > 0 else "SELL"
             print(f"- {t.ts_ms} {side} px={t.price:.2f} qty={t.qty:.6f} fee=${t.fee_usd:.4f} {t.reason}")
+
+
+async def main_async() -> None:
+    cfg = load_tbv8_config()
+    await run_simfill_backtest(cfg)
 
 
 def main() -> None:

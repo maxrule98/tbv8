@@ -6,6 +6,7 @@ from typing import Any, List, Optional
 import yaml
 from pydantic import BaseModel, Field
 
+from packages.common.constants import BASE_TIMEFRAME
 from .types import MarketDataVenueId, RoutingMode, VenueId
 
 
@@ -42,7 +43,7 @@ class RoutingConfig(BaseModel):
 class StrategyConfig(BaseModel):
     strategy_id: str
     symbol: str
-    timeframe: str = "1m"
+    timeframe: str = BASE_TIMEFRAME
     risk: RiskConfig = Field(default_factory=RiskConfig)
     routing: RoutingConfig
 

@@ -8,6 +8,7 @@ from loguru import logger
 
 from packages.common.datetime_utils import now_ms, parse_iso8601_to_ms
 from packages.common.timeframes import floor_ts_to_tf, timeframe_to_ms
+from packages.common.constants import BASE_TIMEFRAME, BASE_TF_MS
 
 from packages.common.backfill.types import BackfillAdapter
 from packages.common.backfill.sqlite_store import (
@@ -25,7 +26,7 @@ from packages.market_data.types import EnsureHistoryRequest
 @dataclass(frozen=True)
 class MarketDataPlantConfig:
     # Base timeframe is a design choice - we standardize on 1m everywhere.
-    base_timeframe: str = "1m"
+    base_timeframe: str = BASE_TIMEFRAME
 
 
 class MarketDataPlant:
@@ -49,10 +50,10 @@ class MarketDataPlant:
 
     async def ensure_history(self, req: EnsureHistoryRequest) -> None:
         base_tf = self.cfg.base_timeframe
-        if base_tf != "1m":
-            raise ValueError("This repo standardizes on base_timeframe='1m'")
+        if base_tf != BASE_TIMEFRAME:
+            raise ValueError(f"This repo standardizes on base_timeframe='{BASE_TIMEFRAME}'")
 
-        # Normalize timeframe list: always include 1m
+        # Normalize timeframe list: always include base
         tfs = [tf.strip() for tf in req.timeframes if tf and tf.strip()]
         if base_tf not in tfs:
             tfs = [base_tf, *tfs]
@@ -120,7 +121,7 @@ class MarketDataPlant:
                 #   derived_end_excl = floor((base_max_ts + 1m), tf)
                 # and the last complete candle open is:
                 #   last_complete_open = derived_end_excl - tf_ms
-                derived_end_excl = floor_ts_to_tf(base_max_ts + timeframe_to_ms("1m"), tf)
+                derived_end_excl = floor_ts_to_tf(base_max_ts + BASE_TF_MS, tf)
                 last_complete_open = derived_end_excl - tf_ms
 
                 # Read previous derived coverage (source of truth) - end_ms is EXCLUSIVE.

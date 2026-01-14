@@ -7,14 +7,15 @@ from typing import List, Sequence
 from loguru import logger
 
 from packages.common.timeframes import floor_ts_to_tf, timeframe_to_ms
+from packages.common.constants import BASE_TIMEFRAME, BASE_TF_MS
 from packages.common.backfill.types import OHLCV
 from packages.common.backfill.sqlite_store import upsert_agg
 
 
 def _validate_target_tf(tf: str) -> None:
     ms = timeframe_to_ms(tf)
-    if ms <= 60_000:
-        raise ValueError(f"timeframe must be > 1m for aggregation targets (got {tf})")
+    if ms <= BASE_TF_MS:
+        raise ValueError(f"timeframe must be > {BASE_TIMEFRAME} for aggregation targets (got {tf})")
 
 
 def load_1m_range(conn: sqlite3.Connection, venue: str, symbol: str, start_ms: int, end_ms: int) -> List[OHLCV]:
@@ -144,17 +145,17 @@ def build_aggregates(
     timeframes: Sequence[str],
     chunk_days: int = 7,
 ) -> None:
-    targets = [tf.strip() for tf in timeframes if tf.strip() and tf.strip() != "1m"]
+    targets = [tf.strip() for tf in timeframes if tf.strip() and tf.strip() != BASE_TIMEFRAME]
     if not targets:
-        logger.info("No target timeframes (or only 1m) requested - nothing to do.")
+        logger.info("No target timeframes (or only {base}) requested - nothing to do.", base=BASE_TIMEFRAME)
         return
 
     if chunk_days <= 0:
         raise ValueError("chunk_days must be > 0")
 
-    # Defensive alignment to 1m
-    start_ms = floor_ts_to_tf(int(start_ms), "1m")
-    end_ms = floor_ts_to_tf(int(end_ms), "1m")
+    # Defensive alignment to base
+    start_ms = floor_ts_to_tf(int(start_ms), BASE_TIMEFRAME)
+    end_ms = floor_ts_to_tf(int(end_ms), BASE_TIMEFRAME)
 
     chunk_ms = chunk_days * 24 * 60 * 60_000
 

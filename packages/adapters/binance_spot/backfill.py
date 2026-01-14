@@ -6,6 +6,7 @@ from typing import Optional
 
 import aiohttp
 
+from packages.common.constants import BASE_TIMEFRAME
 from packages.common.backfill.types import OHLCV
 
 
@@ -28,8 +29,8 @@ class BinanceSpotBackfillAdapter:
         end_ms: int,
         limit: int = 1000,
     ) -> list[OHLCV]:
-        if timeframe != "1m":
-            raise ValueError("BinanceSpotBackfillAdapter is used for 1m base backfill only (TBV8 v0).")
+        if timeframe != BASE_TIMEFRAME:
+            raise ValueError(f"BinanceSpotBackfillAdapter is used for {BASE_TIMEFRAME} base backfill only (TBV8 v0).")
 
         binance_symbol = self._symbol_to_binance(symbol)
         params = {
