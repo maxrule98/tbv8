@@ -8,19 +8,16 @@ from loguru import logger
 
 from packages.common.datetime_utils import now_ms, parse_iso8601_to_ms
 from packages.common.timeframes import floor_ts_to_tf, timeframe_to_ms
-from packages.common.constants import BASE_TIMEFRAME, BASE_TF_MS
 
 from packages.common.backfill.types import BackfillAdapter
 from packages.common.backfill.sqlite_store import (
     CoverageRow,
     ensure_schema,
-    get_max_ts,
-    get_min_max_ts,
-    upsert_1m,
+    get_max_ts_tf,
+    get_min_max_ts_tf,
     upsert_coverage,
-    upsert_agg,
+    upsert_tf,
 )
-from packages.common.backfill.aggregate import load_1m_range, aggregate_from_1m
 
 
 @dataclass(frozen=True)
@@ -46,95 +43,109 @@ class BackfillService:
     async def ensure_history(self, spec: BackfillSpec) -> None:
         adapter = self._adapter(spec.venue)
 
-        start_ms = floor_ts_to_tf(parse_iso8601_to_ms(spec.start_date), BASE_TIMEFRAME)
-        end_ms = (
-            floor_ts_to_tf(parse_iso8601_to_ms(spec.end_date), BASE_TIMEFRAME)
-            if spec.end_date
-            else floor_ts_to_tf(now_ms(), BASE_TIMEFRAME)
-        )
-
-        if end_ms <= start_ms:
-            raise ValueError(f"end_ms <= start_ms (start_date={spec.start_date} end_date={spec.end_date})")
-
         conn = sqlite3.connect(spec.db_path)
         try:
             ensure_schema(conn)
 
-            max_ts_1m = get_max_ts(conn, adapter.venue, spec.symbol, BASE_TIMEFRAME)
+            for tf in spec.timeframes:
+                tf_ms = timeframe_to_ms(tf)
 
-            if max_ts_1m is None:
-                fetch_start = start_ms
-                logger.info(
-                    "History empty -> bootstrap 1m venue={} symbol={} [{}..{})",
-                    adapter.venue,
-                    spec.symbol,
-                    start_ms,
-                    end_ms,
+                start_ms = floor_ts_to_tf(parse_iso8601_to_ms(spec.start_date), tf)
+                end_ms = (
+                    floor_ts_to_tf(parse_iso8601_to_ms(spec.end_date), tf)
+                    if spec.end_date
+                    else floor_ts_to_tf(now_ms(), tf)
                 )
-            else:
-                fetch_start = max(max_ts_1m + BASE_TF_MS, start_ms)
-                if fetch_start >= end_ms:
+
+                if end_ms <= start_ms:
+                    raise ValueError(f"end_ms <= start_ms for tf={tf} ({spec.start_date}..{spec.end_date})")
+
+                max_ts = get_max_ts_tf(conn, adapter.venue, spec.symbol, tf)
+
+                if max_ts is None:
+                    fetch_start = start_ms
                     logger.info(
-                        "History already up-to-date venue={} symbol={} max_ts={} end_ms={}",
+                        "History empty -> bootstrap tf={} venue={} symbol={} [{}..{})",
+                        tf,
                         adapter.venue,
                         spec.symbol,
-                        max_ts_1m,
+                        start_ms,
                         end_ms,
                     )
-                    self._aggregate_all(conn, adapter.venue, spec.symbol, start_ms, end_ms, spec.timeframes)
-                    conn.commit()
-                    return
+                else:
+                    fetch_start = max(max_ts + tf_ms, start_ms)
+                    if fetch_start >= end_ms:
+                        logger.info(
+                            "History up-to-date tf={} venue={} symbol={} max_ts={} end_ms={}",
+                            tf,
+                            adapter.venue,
+                            spec.symbol,
+                            max_ts,
+                            end_ms,
+                        )
+                        # Still ensure coverage is correct from materialized table
+                        mm = get_min_max_ts_tf(conn, adapter.venue, spec.symbol, tf)
+                        if mm is not None:
+                            min_ts, max_ts2 = mm
+                            upsert_coverage(
+                                conn,
+                                CoverageRow(
+                                    venue=adapter.venue,
+                                    symbol=spec.symbol,
+                                    timeframe=tf,
+                                    start_ms=min_ts,
+                                    end_ms=max_ts2 + tf_ms,  # end-exclusive
+                                    updated_at_ms=now_ms(),
+                                ),
+                            )
+                            conn.commit()
+                        continue
 
-                logger.info(
-                    "History present -> tail update venue={} symbol={} fetch [{}..{}) (max_ts={})",
-                    adapter.venue,
-                    spec.symbol,
-                    fetch_start,
-                    end_ms,
-                    max_ts_1m,
+                    logger.info(
+                        "History present -> tail update tf={} venue={} symbol={} fetch [{}..{}) (max_ts={})",
+                        tf,
+                        adapter.venue,
+                        spec.symbol,
+                        fetch_start,
+                        end_ms,
+                        max_ts,
+                    )
+
+                await self._backfill_tf(conn, adapter, spec.symbol, tf, fetch_start, end_ms)
+
+                mm = get_min_max_ts_tf(conn, adapter.venue, spec.symbol, tf)
+                if mm is None:
+                    logger.warning("Backfill wrote no rows? tf={} venue={} symbol={}", tf, adapter.venue, spec.symbol)
+                    continue
+
+                min_ts, max_ts2 = mm
+                upsert_coverage(
+                    conn,
+                    CoverageRow(
+                        venue=adapter.venue,
+                        symbol=spec.symbol,
+                        timeframe=tf,
+                        start_ms=min_ts,
+                        end_ms=max_ts2 + tf_ms,  # end-exclusive
+                        updated_at_ms=now_ms(),
+                    ),
                 )
-
-            await self._backfill_1m(conn, adapter, spec.symbol, fetch_start, end_ms)
-
-            upsert_coverage(
-                conn,
-                CoverageRow(
-                    venue=adapter.venue,
-                    symbol=spec.symbol,
-                    timeframe=BASE_TIMEFRAME,
-                    start_ms=start_ms,
-                    end_ms=end_ms,
-                    updated_at_ms=now_ms(),
-                ),
-            )
-
-            # dirty-window aggregation start
-            agg_start = start_ms
-            if max_ts_1m is not None:
-                max_tf_ms = 0
-                for tf in spec.timeframes:
-                    if tf != BASE_TIMEFRAME:
-                        max_tf_ms = max(max_tf_ms, timeframe_to_ms(tf))
-                if max_tf_ms > 0:
-                    agg_start = max(start_ms, fetch_start - max_tf_ms)
-
-            self._aggregate_all(conn, adapter.venue, spec.symbol, agg_start, end_ms, spec.timeframes)
-
-            conn.commit()
-            logger.info("ensure_history complete venue={} symbol={} [{}..{})", adapter.venue, spec.symbol, start_ms, end_ms)
+                conn.commit()
+                logger.info("ensure_history tf={} complete coverage=[{}..{})", tf, min_ts, max_ts2 + tf_ms)
 
         finally:
             conn.close()
 
-    async def _backfill_1m(
+    async def _backfill_tf(
         self,
         conn: sqlite3.Connection,
         adapter: BackfillAdapter,
         symbol: str,
+        tf: str,
         start_ms: int,
         end_ms: int,
     ) -> None:
-        tf_ms = BASE_TF_MS
+        tf_ms = timeframe_to_ms(tf)
         cursor = int(start_ms)
         pages = 0
         total_rows = 0
@@ -142,99 +153,36 @@ class BackfillService:
         while cursor < end_ms:
             rows = await adapter.fetch_ohlcv(
                 symbol=symbol,
-                timeframe=BASE_TIMEFRAME,
+                timeframe=tf,
                 start_ms=cursor,
                 end_ms=end_ms,
                 limit=1000,
             )
 
             if not rows:
-                logger.warning("Backfill got 0 rows at cursor={} - stopping", cursor)
+                logger.warning("Backfill got 0 rows tf={} at cursor={} - stopping", tf, cursor)
                 break
 
-            wrote = upsert_1m(conn, adapter.venue, symbol, rows)
+            wrote = upsert_tf(conn, tf, adapter.venue, symbol, rows)
             conn.commit()
 
             pages += 1
             total_rows += wrote
 
-            last_ts = floor_ts_to_tf(rows[-1].ts_ms, BASE_TIMEFRAME)
+            last_ts = floor_ts_to_tf(rows[-1].ts_ms, tf)
             next_cursor = last_ts + tf_ms
             if next_cursor <= cursor:
-                logger.warning("Backfill cursor did not advance (cursor={} last_ts={}) - stopping", cursor, last_ts)
+                logger.warning(
+                    "Backfill cursor did not advance tf={} (cursor={} last_ts={}) - stopping",
+                    tf,
+                    cursor,
+                    last_ts,
+                )
                 break
 
             cursor = next_cursor
 
             if pages % 10 == 0:
-                logger.info("Backfill progress pages={} total_rows={} cursor={}", pages, total_rows, cursor)
+                logger.info("Backfill progress tf={} pages={} total_rows={} cursor={}", tf, pages, total_rows, cursor)
 
-        logger.info("Backfill done pages={} total_rows={}", pages, total_rows)
-
-    def _aggregate_all(
-        self,
-        conn: sqlite3.Connection,
-        venue: str,
-        symbol: str,
-        start_ms: int,
-        end_ms: int,
-        timeframes: Sequence[str],
-    ) -> None:
-        targets = [tf for tf in timeframes if tf != BASE_TIMEFRAME]
-        if not targets:
-            return
-
-        start_ms = floor_ts_to_tf(int(start_ms), BASE_TIMEFRAME)
-        end_ms = floor_ts_to_tf(int(end_ms), BASE_TIMEFRAME)
-
-        for tf in targets:
-            tf_ms = timeframe_to_ms(tf)
-
-            complete_end = floor_ts_to_tf(end_ms, tf)
-            if complete_end <= start_ms:
-                continue
-
-            tf_start = floor_ts_to_tf(start_ms, tf)
-
-            base = load_1m_range(conn, venue, symbol, tf_start, complete_end)
-            if not base:
-                logger.warning(
-                    "No 1m bars for venue={} symbol={} in [{}..{}) - cannot aggregate tf={}",
-                    venue,
-                    symbol,
-                    tf_start,
-                    complete_end,
-                    tf,
-                )
-                continue
-
-            agg = aggregate_from_1m(base, timeframe=tf, complete_end_ms=complete_end)
-            if not agg:
-                continue
-
-            upserted = upsert_agg(conn, tf, venue, symbol, agg)
-
-            # ✅ Coverage comes from the actual materialized table contents
-            mm = get_min_max_ts(conn, venue, symbol, tf)
-            if mm is not None:
-                min_ts, max_ts = mm
-                upsert_coverage(
-                    conn,
-                    CoverageRow(
-                        venue=venue,
-                        symbol=symbol,
-                        timeframe=tf,
-                        start_ms=min_ts,
-                        end_ms=max_ts + tf_ms,
-                        updated_at_ms=now_ms(),
-                    ),
-                )
-                logger.info(
-                    "Aggregated 1m -> {} upserted={} coverage=[{}..{})",
-                    tf,
-                    upserted,
-                    min_ts,
-                    max_ts + tf_ms,
-                )
-            else:
-                logger.info("Aggregated 1m -> {} upserted={} (coverage unknown - empty table?)", tf, upserted)
+        logger.info("Backfill done tf={} pages={} total_rows={}", tf, pages, total_rows)

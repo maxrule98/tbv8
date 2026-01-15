@@ -1,13 +1,20 @@
 from __future__ import annotations
 
+import random
 import asyncio
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Set
 
 import aiohttp
 
-from packages.common.constants import BASE_TIMEFRAME
 from packages.common.backfill.types import OHLCV
+
+
+BINANCE_SUPPORTED_TFS: Set[str] = {
+    "1m", "3m", "5m", "15m", "30m",
+    "1h", "2h", "4h", "6h", "8h", "12h",
+    "1d", "3d", "1w", "1M",
+}
 
 
 @dataclass
@@ -18,8 +25,14 @@ class BinanceSpotBackfillAdapter:
     max_retries: int = 5
 
     def _symbol_to_binance(self, symbol: str) -> str:
-        # "BTC/USDT" -> "BTCUSDT"
         return symbol.replace("/", "").upper()
+
+    def _validate_tf(self, timeframe: str) -> None:
+        if timeframe not in BINANCE_SUPPORTED_TFS:
+            raise ValueError(
+                f"Unsupported Binance interval timeframe={timeframe!r}. "
+                f"Supported: {sorted(BINANCE_SUPPORTED_TFS)}"
+            )
 
     async def fetch_ohlcv(
         self,
@@ -29,15 +42,13 @@ class BinanceSpotBackfillAdapter:
         end_ms: int,
         limit: int = 1000,
     ) -> list[OHLCV]:
-        if timeframe != BASE_TIMEFRAME:
-            raise ValueError(f"BinanceSpotBackfillAdapter is used for {BASE_TIMEFRAME} base backfill only (TBV8 v0).")
+        self._validate_tf(timeframe)
 
         binance_symbol = self._symbol_to_binance(symbol)
         params = {
             "symbol": binance_symbol,
             "interval": timeframe,
             "startTime": str(start_ms),
-            "endTime": str(end_ms - 1),
             "limit": str(limit),
         }
 
@@ -68,10 +79,12 @@ class BinanceSpotBackfillAdapter:
                         )
                     )
                 out.sort(key=lambda x: x.ts_ms)
+                out = [b for b in out if b.ts_ms < end_ms]
                 return out
 
             except Exception as e:
                 last_err = e
-                await asyncio.sleep(min(2 ** (attempt - 1), 10))
+                base = min(2 ** (attempt - 1), 10)
+                await asyncio.sleep(base + random.uniform(0, 0.25))
 
         raise RuntimeError(f"Binance backfill failed after {self.max_retries} attempts") from last_err

@@ -22,6 +22,22 @@ class CoverageRow:
 def ensure_schema(conn: sqlite3.Connection) -> None:
     conn.execute(
         """
+        CREATE TABLE IF NOT EXISTS history_coverage (
+          venue TEXT NOT NULL,
+          symbol TEXT NOT NULL,
+          timeframe TEXT NOT NULL,
+          start_ms INTEGER NOT NULL,
+          end_ms INTEGER NOT NULL,
+          updated_at_ms INTEGER NOT NULL,
+          PRIMARY KEY (venue, symbol, timeframe)
+        );
+        """
+    )
+    conn.commit()
+
+
+    conn.execute(
+        """
         CREATE TABLE IF NOT EXISTS ohlcv_1m (
           venue TEXT NOT NULL,
           symbol TEXT NOT NULL,
@@ -51,56 +67,132 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     )
     conn.commit()
 
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS known_missing_ranges (
+        venue TEXT NOT NULL,
+        symbol TEXT NOT NULL,
+        timeframe TEXT NOT NULL,
+        start_ms INTEGER NOT NULL,       -- inclusive
+        end_ms_excl INTEGER NOT NULL,    -- exclusive
+        reason TEXT NOT NULL,            -- e.g. 'binance_no_data'
+        updated_at_ms INTEGER NOT NULL,
+        PRIMARY KEY (venue, symbol, timeframe, start_ms, end_ms_excl)
+        );
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_known_missing_lookup
+        ON known_missing_ranges (venue, symbol, timeframe, start_ms, end_ms_excl);
+        """
+    )
+    conn.commit()
 
-def get_min_max_ts(conn: sqlite3.Connection, venue: str, symbol: str, timeframe: str) -> Tuple[Optional[int], Optional[int]]:
-    """
-    Return (min_ts_ms, max_ts_ms) for a stored timeframe.
 
-    We only guarantee this for the 1m base table today.
-    Aggregates are derived and should be tracked via history_coverage, not by scanning.
-    """
-    if timeframe != BASE_TIMEFRAME:
+# --- Compatibility shims (temporary while migrating callers to *_tf APIs) ---
+
+def get_max_ts(conn: sqlite3.Connection, venue: str, symbol: str, timeframe: str) -> int | None:
+    # historically used by Plant/tests
+    return get_max_ts_tf(conn, venue, symbol, timeframe)
+
+def get_min_max_ts(conn: sqlite3.Connection, venue: str, symbol: str, timeframe: str):
+    # historically used by Plant/tests
+    mm = get_min_max_ts_tf(conn, venue, symbol, timeframe)
+    if mm is None:
         return (None, None)
+    return mm
+
+def upsert_1m(conn: sqlite3.Connection, venue: str, symbol: str, rows: Iterable[OHLCV]) -> int:
+    # historically wrote to ohlcv_1m. Now we standardize on bars_1m.
+    # This makes old code write into bars_1m without changing call sites.
+    return upsert_tf(conn, "1m", venue, symbol, list(rows))
+
+def get_min_ts(conn: sqlite3.Connection, venue: str, symbol: str, tf: str) -> int | None:
+    """
+    Backwards-compat helper for older callers (e.g. MarketDataPlant).
+    Returns MIN(ts_ms) for a bars_{tf} table, or None if empty.
+    """
+    mm = get_min_max_ts_tf(conn, venue, symbol, tf)
+    if mm is None:
+        return None
+    return mm[0]
+
+def get_max_ts_tf(conn: sqlite3.Connection, venue: str, symbol: str, tf: str) -> int | None:
+    """
+    Return MAX(ts_ms) for bars_{tf} (or None if empty).
+    """
+    ensure_bars_table(conn, tf)
+    t = _bars_table(tf)
+    row = conn.execute(
+        f"SELECT MAX(ts_ms) FROM {t} WHERE venue=? AND symbol=?",
+        (venue, symbol),
+    ).fetchone()
+    return None if not row or row[0] is None else int(row[0])
+
+def get_min_max_ts_tf(
+    conn: sqlite3.Connection,
+    venue: str,
+    symbol: str,
+    tf: str,
+) -> tuple[int, int] | None:
+    """
+    Return (min_ts_ms, max_ts_ms) for bars_{tf}, or None if table has no rows.
+    """
+    ensure_bars_table(conn, tf)
+    t = _bars_table(tf)
 
     row = conn.execute(
-        "SELECT MIN(ts_ms), MAX(ts_ms) FROM ohlcv_1m WHERE venue=? AND symbol=?",
+        f"SELECT MIN(ts_ms), MAX(ts_ms) FROM {t} WHERE venue=? AND symbol=?",
         (venue, symbol),
     ).fetchone()
 
-    if not row:
-        return (None, None)
-
-    min_ts = row[0]
-    max_ts = row[1]
-    return (int(min_ts) if min_ts is not None else None, int(max_ts) if max_ts is not None else None)
-
-
-def get_max_ts(conn: sqlite3.Connection, venue: str, symbol: str, timeframe: str) -> Optional[int]:
-    _min_ts, max_ts = get_min_max_ts(conn, venue, symbol, timeframe)
-    return max_ts
-
-def get_min_ts(conn: sqlite3.Connection, venue: str, symbol: str, timeframe: str) -> Optional[int]:
-    if timeframe == BASE_TIMEFRAME:
-        row = conn.execute(
-            "SELECT MIN(ts_ms) FROM ohlcv_1m WHERE venue=? AND symbol=?",
-            (venue, symbol),
-        ).fetchone()
-        if not row or row[0] is None:
-            return None
-        return int(row[0])
-
-    table = f"bars_{timeframe}"
-    try:
-        row = conn.execute(
-            f"SELECT MIN(ts_ms) FROM {table} WHERE venue=? AND symbol=?",
-            (venue, symbol),
-        ).fetchone()
-    except sqlite3.OperationalError:
+    if not row or row[0] is None or row[1] is None:
         return None
 
-    if not row or row[0] is None:
-        return None
-    return int(row[0])
+    return int(row[0]), int(row[1])
+
+
+# def get_min_max_ts(conn: sqlite3.Connection, venue: str, symbol: str, timeframe: str) -> Tuple[Optional[int], Optional[int]]:
+#     """
+#     Return (min_ts_ms, max_ts_ms) for a stored timeframe.
+
+#     We only guarantee this for the 1m base table today.
+#     Aggregates are derived and should be tracked via history_coverage, not by scanning.
+#     """
+
+#     row = conn.execute(
+#         "SELECT MIN(ts_ms), MAX(ts_ms) FROM ohlcv_1m WHERE venue=? AND symbol=?",
+#         (venue, symbol),
+#     ).fetchone()
+
+#     if not row:
+#         return (None, None)
+
+#     min_ts = row[0]
+#     max_ts = row[1]
+#     return (int(min_ts) if min_ts is not None else None, int(max_ts) if max_ts is not None else None)
+
+
+# def get_min_max_ts_tf(conn: sqlite3.Connection, venue: str, symbol: str, tf: str) -> tuple[int,int] | None:
+#     ensure_bars_table(conn, tf)
+#     t = _bars_table(tf)
+#     row = conn.execute(
+#         f"SELECT MIN(ts_ms), MAX(ts_ms) FROM {t} WHERE venue=? AND symbol=?",
+#         (venue, symbol),
+#     ).fetchone()
+#     if not row or row[0] is None or row[1] is None:
+#         return None
+#     return int(row[0]), int(row[1])
+
+# def get_max_ts_tf(conn: sqlite3.Connection, venue: str, symbol: str, tf: str) -> int | None:
+#     ensure_bars_table(conn, tf)
+#     t = _bars_table(tf)
+#     row = conn.execute(
+#         f"SELECT MAX(ts_ms) FROM {t} WHERE venue=? AND symbol=?",
+#         (venue, symbol),
+#     ).fetchone()
+#     return None if not row or row[0] is None else int(row[0])
 
 
 def get_coverage(conn: sqlite3.Connection, venue: str, symbol: str, timeframe: str) -> Optional[CoverageRow]:
@@ -140,25 +232,68 @@ def upsert_coverage(conn: sqlite3.Connection, row: CoverageRow) -> None:
     )
 
 
-def upsert_1m(conn: sqlite3.Connection, venue: str, symbol: str, rows: Iterable[OHLCV]) -> int:
-    cur = conn.cursor()
-    wrote = 0
-    for r in rows:
-        cur.execute(
-            """
-            INSERT INTO ohlcv_1m (venue, symbol, ts_ms, open, high, low, close, volume)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(venue, symbol, ts_ms) DO UPDATE SET
-              open=excluded.open,
-              high=excluded.high,
-              low=excluded.low,
-              close=excluded.close,
-              volume=excluded.volume
-            """,
-            (venue, symbol, int(r.ts_ms), float(r.open), float(r.high), float(r.low), float(r.close), float(r.volume)),
-        )
-        wrote += 1
-    return wrote
+# def upsert_1m(conn: sqlite3.Connection, venue: str, symbol: str, rows: Iterable[OHLCV]) -> int:
+#     cur = conn.cursor()
+#     wrote = 0
+#     for r in rows:
+#         cur.execute(
+#             """
+#             INSERT INTO ohlcv_1m (venue, symbol, ts_ms, open, high, low, close, volume)
+#             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+#             ON CONFLICT(venue, symbol, ts_ms) DO UPDATE SET
+#               open=excluded.open,
+#               high=excluded.high,
+#               low=excluded.low,
+#               close=excluded.close,
+#               volume=excluded.volume
+#             """,
+#             (venue, symbol, int(r.ts_ms), float(r.open), float(r.high), float(r.low), float(r.close), float(r.volume)),
+#         )
+#         wrote += 1
+#     return wrote
+
+
+def record_known_missing_range(
+    conn: sqlite3.Connection,
+    *,
+    venue: str,
+    symbol: str,
+    tf: str,
+    start_ms: int,
+    end_ms_excl: int,
+    reason: str,
+    updated_at_ms: int,
+) -> None:
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO known_missing_ranges
+          (venue, symbol, timeframe, start_ms, end_ms_excl, reason, updated_at_ms)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (venue, symbol, tf, int(start_ms), int(end_ms_excl), reason, int(updated_at_ms)),
+    )
+
+def is_known_missing_range(
+    conn: sqlite3.Connection,
+    *,
+    venue: str,
+    symbol: str,
+    tf: str,
+    start_ms: int,
+    end_ms_excl: int,
+) -> bool:
+    row = conn.execute(
+        """
+        SELECT 1
+        FROM known_missing_ranges
+        WHERE venue=? AND symbol=? AND timeframe=?
+          AND start_ms<=?
+          AND end_ms_excl>=?
+        LIMIT 1
+        """,
+        (venue, symbol, tf, int(start_ms), int(end_ms_excl)),
+    ).fetchone()
+    return row is not None
 
 
 def ensure_agg_table(conn: sqlite3.Connection, timeframe: str) -> None:
@@ -312,21 +447,24 @@ class GapRange:
     start_ms: int        # inclusive
     end_ms_excl: int     # exclusive
 
-def find_gaps_1m(
+def find_gaps_tf(
     conn: sqlite3.Connection,
     *,
     venue: str,
     symbol: str,
+    tf: str,
     start_ms: int | None = None,
     end_ms_excl: int | None = None,
     limit: int = 10_000,
 ) -> list[GapRange]:
     """
-    Find gaps in ohlcv_1m where consecutive ts_ms differ != 60_000.
-    Returns ranges [gap_start, gap_end_excl) measured in 1m boundaries.
-
-    Note: This is deterministic and uses the DB contents as truth.
+    Find gaps in bars_<tf> where consecutive ts_ms differ != tf_ms.
+    Returns ranges [gap_start, gap_end_excl), aligned to tf boundaries.
     """
+    ensure_bars_table(conn, tf)
+    table = _bars_table(tf)
+    tf_ms = timeframe_to_ms(tf)
+
     where = ["venue=? AND symbol=?"]
     params: list[object] = [venue, symbol]
 
@@ -341,16 +479,16 @@ def find_gaps_1m(
     WITH ordered AS (
       SELECT ts_ms,
              LAG(ts_ms) OVER (ORDER BY ts_ms) AS prev_ts
-      FROM ohlcv_1m
+      FROM {table}
       WHERE {" AND ".join(where)}
     ),
     gaps AS (
       SELECT
-        (prev_ts + 60000) AS gap_start,
+        (prev_ts + {tf_ms}) AS gap_start,
         ts_ms AS gap_end,
         (ts_ms - prev_ts) AS delta
       FROM ordered
-      WHERE prev_ts IS NOT NULL AND (ts_ms - prev_ts) != 60000
+      WHERE prev_ts IS NOT NULL AND (ts_ms - prev_ts) != {tf_ms}
     )
     SELECT gap_start, gap_end
     FROM gaps
@@ -381,14 +519,16 @@ def resolve_contiguous_window(
     Given an intended [start_ms, end_ms_excl), return a stricter window that contains
     no gaps for this venue/symbol/timeframe by moving start forward to after the last gap.
 
-    This preserves Option A end-exclusive semantics and keeps determinism.
+    Option A semantics: end_ms_excl is exclusive.
     """
     tf_ms = timeframe_to_ms(timeframe)
-    table = f"bars_{timeframe}"
 
     conn = sqlite3.connect(db_path)
     try:
-        # Find the *last* gap inside the requested window.
+        ensure_schema(conn)
+        ensure_bars_table(conn, timeframe)
+        table = _bars_table(timeframe)
+
         row = conn.execute(
             f"""
             WITH ordered AS (
@@ -398,7 +538,7 @@ def resolve_contiguous_window(
               WHERE venue=? AND symbol=? AND ts_ms >= ? AND ts_ms < ?
             ),
             gaps AS (
-              SELECT prev_ts, ts_ms, (ts_ms - prev_ts) AS delta
+              SELECT prev_ts, ts_ms
               FROM ordered
               WHERE prev_ts IS NOT NULL AND (ts_ms - prev_ts) != ?
             )
@@ -413,10 +553,7 @@ def resolve_contiguous_window(
         if row is None or row[0] is None:
             return start_ms, end_ms_excl
 
-        # If there is a gap, we move start to the bar AFTER the gap (the current ts_ms).
-        new_start = int(row[0])
-
-        # Align just in case (should already be aligned)
+        new_start = int(row[0])  # move to bar AFTER the gap
         new_start = ceil_ts_to_tf(new_start, timeframe)
 
         if end_ms_excl <= new_start:
@@ -427,3 +564,44 @@ def resolve_contiguous_window(
         return new_start, end_ms_excl
     finally:
         conn.close()
+
+def _bars_table(tf: str) -> str:
+    # safe because tf is validated upstream (or validate here too)
+    return f"bars_{tf}"
+
+def ensure_bars_table(conn: sqlite3.Connection, tf: str) -> None:
+    t = _bars_table(tf)
+    conn.execute(f"""
+    CREATE TABLE IF NOT EXISTS {t} (
+      venue TEXT NOT NULL,
+      symbol TEXT NOT NULL,
+      ts_ms INTEGER NOT NULL,
+      open REAL NOT NULL,
+      high REAL NOT NULL,
+      low REAL NOT NULL,
+      close REAL NOT NULL,
+      volume REAL NOT NULL,
+      PRIMARY KEY (venue, symbol, ts_ms)
+    );
+    """)
+    conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{t}_lookup ON {t} (venue, symbol, ts_ms);")
+
+def upsert_tf(conn: sqlite3.Connection, tf: str, venue: str, symbol: str, rows: list[OHLCV]) -> int:
+    ensure_bars_table(conn, tf)
+    t = _bars_table(tf)
+    cur = conn.executemany(
+        f"""
+        INSERT INTO {t} (venue, symbol, ts_ms, open, high, low, close, volume)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(venue, symbol, ts_ms) DO UPDATE SET
+          open=excluded.open,
+          high=excluded.high,
+          low=excluded.low,
+          close=excluded.close,
+          volume=excluded.volume
+        """,
+        [(venue, symbol, r.ts_ms, r.open, r.high, r.low, r.close, r.volume) for r in rows],
+    )
+    return cur.rowcount
+
+

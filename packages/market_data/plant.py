@@ -21,7 +21,7 @@ from packages.common.backfill.sqlite_store import (
     get_coverage,
 )
 from packages.common.backfill.service import BackfillService, BackfillSpec
-from packages.common.backfill.aggregate import build_aggregates
+# from packages.common.backfill.aggregate import build_aggregates
 from packages.common.backfill.repair import GapRepairService, GapRepairConfig
 from packages.market_data.types import EnsureHistoryRequest
 
@@ -102,7 +102,7 @@ class MarketDataPlant:
         # After base ensure_history
         repair = GapRepairService(self._backfill, cfg=GapRepairConfig(
             max_gap_minutes=60 * 24 * 14,
-            chunk_minutes=1000,
+            chunk_limit=1000,
             max_ranges=500,
         ))
 
@@ -110,10 +110,11 @@ class MarketDataPlant:
         scan_start_ms = start_ms
         scan_end_ms_excl = end_ms
 
-        await repair.repair_1m_gaps(
+        await repair.repair_gaps(
             db_path=req.db_path,
             venue=req.venue,
             symbol=req.symbol,
+            timeframe=base_tf,   # "1m"
             scan_start_ms=scan_start_ms,
             scan_end_ms_excl=scan_end_ms_excl,
         )
@@ -180,16 +181,16 @@ class MarketDataPlant:
                     )
                     continue
 
-                # Build aggregates from base in chunks (build_aggregates uses [start..end))
-                build_aggregates(
-                    conn,
-                    venue=req.venue,
-                    symbol=req.symbol,
-                    start_ms=derived_start,
-                    end_ms=derived_end_excl,
-                    timeframes=[tf],
-                    chunk_days=req.chunk_days,
-                )
+                # # Build aggregates from base in chunks (build_aggregates uses [start..end))
+                # build_aggregates(
+                #     conn,
+                #     venue=req.venue,
+                #     symbol=req.symbol,
+                #     start_ms=derived_start,
+                #     end_ms=derived_end_excl,
+                #     timeframes=[tf],
+                #     chunk_days=req.chunk_days,
+                # )
 
                 if prev is None:
                     # Determine true derived start from actual stored bars.

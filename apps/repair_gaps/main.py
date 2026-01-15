@@ -59,7 +59,7 @@ async def main_async() -> None:
         ),
     )
 
-    attempted = await repair.repair_1m_gaps(
+    attempted = await repair.repair_gaps(
         db_path=args.db_path,
         venue=args.venue,
         symbol=args.symbol,
