@@ -24,5 +24,13 @@ def parse_iso8601_to_ms(s: str) -> int:
     return int(dt.timestamp() * 1000)
 
 
+def ms_to_iso8601_z(ts_ms: int) -> str:
+    """
+    Epoch ms -> ISO8601 Zulu string, e.g. 1700000000000 -> "2023-11-14T22:13:20Z"
+    """
+    dt = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc)
+    return dt.isoformat().replace("+00:00", "Z")
+
+
 def now_ms() -> int:
     return int(datetime.now(tz=timezone.utc).timestamp() * 1000)

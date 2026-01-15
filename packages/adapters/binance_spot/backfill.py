@@ -37,7 +37,7 @@ class BinanceSpotBackfillAdapter:
             "symbol": binance_symbol,
             "interval": timeframe,
             "startTime": str(start_ms),
-            "endTime": str(end_ms),
+            "endTime": str(end_ms - 1),
             "limit": str(limit),
         }
 

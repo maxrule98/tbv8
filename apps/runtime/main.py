@@ -13,7 +13,8 @@ from packages.common.timeframes import timeframe_to_ms
 from packages.common.backfill.sqlite_store import (
     get_coverage, 
     ensure_schema, 
-    resolve_bar_window_from_coverage
+    resolve_bar_window_from_coverage,
+    resolve_contiguous_window
 )
 
 from packages.market_data.plant import MarketDataPlant
@@ -101,6 +102,27 @@ async def run_simfill_backtest(cfg) -> None:
         requested_end_ms=requested_end_ms,
     )
 
+    orig_start = start_ms
+    orig_end = end_ms_excl
+
+    start_ms, end_ms_excl = resolve_contiguous_window(
+        db_path=str(cfg.data.db_path),
+        venue=venue,
+        symbol=symbol,
+        timeframe=timeframe,
+        start_ms=start_ms,
+        end_ms_excl=end_ms_excl,
+    )
+
+    if start_ms != orig_start:
+        logger.warning(
+            "Trimmed start to enforce contiguity tf={} original_start={} new_start={} end_excl={}",
+            timeframe,
+            orig_start,
+            start_ms,
+            end_ms_excl,
+        )
+
     # 3) Load bars
     bars = load_bars(
         LoadBarsQuery(
@@ -112,6 +134,26 @@ async def run_simfill_backtest(cfg) -> None:
             end_ms=end_ms_excl,
         )
     )
+
+    tf_ms = timeframe_to_ms(timeframe)
+    if not bars:
+        raise RuntimeError("No bars loaded after resolving window.")
+
+    if bars[0].ts_ms != start_ms:
+        raise RuntimeError(f"First bar ts mismatch: got={bars[0].ts_ms} expected={start_ms}")
+
+    expected_last_open = end_ms_excl - tf_ms
+    if bars[-1].ts_ms != expected_last_open:
+        raise RuntimeError(f"Last bar ts mismatch: got={bars[-1].ts_ms} expected={expected_last_open}")
+
+    # Strict contiguity check - fail fast with the first gap location
+    for i in range(1, len(bars)):
+        dt = bars[i].ts_ms - bars[i - 1].ts_ms
+        if dt != tf_ms:
+            raise RuntimeError(
+                f"Gap detected tf={timeframe}: prev={bars[i-1].ts_ms} curr={bars[i].ts_ms} "
+                f"delta={dt} expected={tf_ms}"
+            )
 
     logger.info("Bars range: first={} last={}", _fmt_iso(bars[0].ts_ms), _fmt_iso(bars[-1].ts_ms))
     logger.info(

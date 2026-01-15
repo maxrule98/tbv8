@@ -15,11 +15,14 @@ from packages.common.backfill.sqlite_store import (
     CoverageRow,
     ensure_schema,
     get_max_ts,
+    get_min_ts,
+    get_max_agg_open_ms,
     upsert_coverage,
     get_coverage,
 )
 from packages.common.backfill.service import BackfillService, BackfillSpec
 from packages.common.backfill.aggregate import build_aggregates
+from packages.common.backfill.repair import GapRepairService, GapRepairConfig
 from packages.market_data.types import EnsureHistoryRequest
 
 
@@ -96,6 +99,25 @@ class MarketDataPlant:
             )
         )
 
+        # After base ensure_history
+        repair = GapRepairService(self._backfill, cfg=GapRepairConfig(
+            max_gap_minutes=60 * 24 * 14,
+            chunk_minutes=1000,
+            max_ranges=500,
+        ))
+
+        # Scan a bounded range: from requested start -> requested end (or now), but not infinite.
+        scan_start_ms = start_ms
+        scan_end_ms_excl = end_ms
+
+        await repair.repair_1m_gaps(
+            db_path=req.db_path,
+            venue=req.venue,
+            symbol=req.symbol,
+            scan_start_ms=scan_start_ms,
+            scan_end_ms_excl=scan_end_ms_excl,
+        )
+
         # 2) Ensure derived timeframes exist (aggregate from 1m)
         targets = [tf for tf in timeframes if tf != base_tf]
         if not targets:
@@ -146,7 +168,7 @@ class MarketDataPlant:
                     cov_start = prev.start_ms  # never change established start
                 else:
                     derived_start = req_start_tf
-                    cov_start = req_start_tf
+                    cov_start = None
 
                 # If window is too small to produce a completed candle, skip
                 if derived_end_excl <= derived_start:
@@ -169,8 +191,26 @@ class MarketDataPlant:
                     chunk_days=req.chunk_days,
                 )
 
-                # Coverage end is EXCLUSIVE, so it should be last_complete_open + tf_ms == derived_end_excl
-                cov_end_excl = max(prev.end_ms, derived_end_excl) if prev else derived_end_excl
+                if prev is None:
+                    # Determine true derived start from actual stored bars.
+                    # This avoids claiming coverage before the market existed (e.g. BTC/USDT pre-listing).
+                    derived_min_ts = get_min_ts(conn, req.venue, req.symbol, tf)
+                    if derived_min_ts is None:
+                        logger.warning("No derived bars written for tf={} - cannot set coverage.", tf)
+                        continue
+                    cov_start = derived_min_ts
+
+                # Determine real derived max from stored bars (source of truth for what exists)
+                derived_max_open = get_max_agg_open_ms(conn, req.venue, req.symbol, tf)
+                if derived_max_open is None:
+                    logger.warning("No derived bars present after aggregation tf={} - cannot set coverage.", tf)
+                    continue
+
+                # coverage end is exclusive
+                real_end_excl = derived_max_open + tf_ms
+
+                # If prev exists, never shrink coverage end (optional; I recommend monotonic)
+                cov_end_excl = max(prev.end_ms, real_end_excl) if prev else real_end_excl
 
                 upsert_coverage(
                     conn,

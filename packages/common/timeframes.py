@@ -26,3 +26,10 @@ def timeframe_to_ms(tf: str) -> int:
 def floor_ts_to_tf(ts_ms: int, tf: str) -> int:
     ms = timeframe_to_ms(tf)
     return (ts_ms // ms) * ms
+
+
+def ceil_ts_to_tf(ts_ms: int, tf: str) -> int:
+    ms = timeframe_to_ms(tf)
+    if ts_ms % ms == 0:
+        return ts_ms
+    return ((ts_ms // ms) + 1) * ms
