@@ -1,29 +1,19 @@
 from __future__ import annotations
 
 import asyncio
-import sqlite3
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Optional
 
 from loguru import logger
 
+from packages.adapters.binance_spot.backfill import BinanceSpotBackfillAdapter
+from packages.backtester.db import LoadBarsQuery, load_bars
 from packages.common.config import load_tbv8_config
 from packages.common.timeframes import timeframe_to_ms
-from packages.common.backfill.sqlite_store import (
-    get_coverage, 
-    ensure_schema, 
-    resolve_bar_window_from_coverage,
-    resolve_contiguous_window
-)
-
+from packages.common.backfill.sqlite_store import resolve_bar_window_from_coverage
 from packages.market_data.plant import MarketDataPlant
+from packages.market_data.synthetic_fill import fill_missing_bars
 from packages.market_data.types import EnsureHistoryRequest
-
-from packages.adapters.binance_spot.backfill import BinanceSpotBackfillAdapter
-
-from packages.backtester.db import LoadBarsQuery, load_bars
-
 from packages.runtime.engine import RuntimeEngine, RuntimeEngineConfig
 from packages.common.types import RoutingMode
 from packages.execution.router import ExecutionRouter, RoutingPlan
@@ -34,9 +24,6 @@ from packages.backtester.strategies.htf_trend_ltf_entry import (
     HTFTrendLTFEntryConfig,
     HTFTrendLTFEntryStrategy,
 )
-
-
-DB_PATH = Path("data/tbv8.sqlite")
 
 
 def _iso_to_ms(iso: str) -> int:
@@ -61,11 +48,22 @@ def _fmt_iso(ts_ms: int) -> str:
     return datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def _select_primary_timeframe(timeframes: list[str]) -> str:
+    """
+    Choose the run-loop timeframe. Deterministic rule:
+    - pick the smallest timeframe by ms (e.g. 1m over 4h).
+    """
+    if not timeframes:
+        raise ValueError("strategy.timeframes must be non-empty")
+    return min(timeframes, key=timeframe_to_ms)
+
+
 async def _ensure_market_data(cfg) -> None:
     plant = MarketDataPlant(adapters=[BinanceSpotBackfillAdapter()])
 
-    # Always ensure base 1m + the strategy tf
-    timeframes = ["1m", "5m", "15m", "1h", cfg.strategy.timeframe]
+    timeframes = list(cfg.strategy.timeframes)
+    if not timeframes:
+        raise ValueError("strategy.timeframes must be non-empty")
 
     await plant.ensure_history(
         EnsureHistoryRequest(
@@ -80,16 +78,17 @@ async def _ensure_market_data(cfg) -> None:
     )
 
 
-
 async def run_simfill_backtest(cfg) -> None:
     venue = cfg.history.market_data_venue
     symbol = cfg.strategy.symbol
-    timeframe = cfg.strategy.timeframe
 
-    # 1) Ensure data exists + aggregates are correct/updated
+    timeframes = list(cfg.strategy.timeframes)
+    timeframe = _select_primary_timeframe(timeframes)  # run-loop tf (typically LTF)
+
+    # 1) Ensure history exists for all configured timeframes
     await _ensure_market_data(cfg)
 
-    # 2) Resolve deterministic load window from coverage
+    # 2) Resolve deterministic load window from coverage (for primary timeframe)
     requested_start_ms = _maybe_ms(cfg.history.start_date)
     requested_end_ms = _maybe_ms(cfg.history.end_date)  # often None
 
@@ -102,29 +101,8 @@ async def run_simfill_backtest(cfg) -> None:
         requested_end_ms=requested_end_ms,
     )
 
-    orig_start = start_ms
-    orig_end = end_ms_excl
-
-    start_ms, end_ms_excl = resolve_contiguous_window(
-        db_path=str(cfg.data.db_path),
-        venue=venue,
-        symbol=symbol,
-        timeframe=timeframe,
-        start_ms=start_ms,
-        end_ms_excl=end_ms_excl,
-    )
-
-    if start_ms != orig_start:
-        logger.warning(
-            "Trimmed start to enforce contiguity tf={} original_start={} new_start={} end_excl={}",
-            timeframe,
-            orig_start,
-            start_ms,
-            end_ms_excl,
-        )
-
-    # 3) Load bars
-    bars = load_bars(
+    # 3) Load sparse bars from SQLite (may contain gaps)
+    sparse_bars = load_bars(
         LoadBarsQuery(
             db_path=str(cfg.data.db_path),
             venue=venue,
@@ -136,37 +114,103 @@ async def run_simfill_backtest(cfg) -> None:
     )
 
     tf_ms = timeframe_to_ms(timeframe)
-    if not bars:
-        raise RuntimeError("No bars loaded after resolving window.")
 
+    if not sparse_bars:
+        raise RuntimeError("No bars loaded after resolving coverage window.")
+
+    # 4) Runtime synthetic fill (do NOT write back to SQLite)
+    filled = list(
+        fill_missing_bars(
+            bars=sparse_bars,
+            start_ms=start_ms,
+            end_ms_excl=end_ms_excl,
+            tf_ms=tf_ms,
+        )
+    )
+
+    if not filled:
+        raise RuntimeError("Synthetic fill produced 0 bars (no anchor bar found).")
+
+    # If your fill_missing_bars yields RuntimeBar(bar=..., synthetic=...), unwrap it.
+    if hasattr(filled[0], "bar"):
+        synthetic_ts = [x.bar.ts_ms for x in filled if getattr(x, "synthetic", False)]
+        synthetic_count = len(synthetic_ts)
+        bars = [x.bar for x in filled]
+
+        if synthetic_count:
+            synthetic_ts.sort()
+            longest_run = 1
+            run = 1
+            for i in range(1, len(synthetic_ts)):
+                if synthetic_ts[i] - synthetic_ts[i - 1] == tf_ms:
+                    run += 1
+                    longest_run = max(longest_run, run)
+                else:
+                    run = 1
+
+            logger.warning(
+                "Synthetic fill applied tf={} injected={} longest_run={} first_synth={} last_synth={}",
+                timeframe,
+                synthetic_count,
+                longest_run,
+                _fmt_iso(synthetic_ts[0]),
+                _fmt_iso(synthetic_ts[-1]),
+            )
+    else:
+        synthetic_count = 0
+        bars = filled
+
+    # If the first emitted bar doesn't match start_ms (no anchor until later),
+    # move start_ms forward to the first available bar.
     if bars[0].ts_ms != start_ms:
-        raise RuntimeError(f"First bar ts mismatch: got={bars[0].ts_ms} expected={start_ms}")
+        logger.warning(
+            "Adjusted start due to missing leading data tf={} requested_start={} adjusted_start={}",
+            timeframe,
+            start_ms,
+            bars[0].ts_ms,
+        )
+        start_ms = bars[0].ts_ms
 
     expected_last_open = end_ms_excl - tf_ms
     if bars[-1].ts_ms != expected_last_open:
-        raise RuntimeError(f"Last bar ts mismatch: got={bars[-1].ts_ms} expected={expected_last_open}")
+        logger.warning(
+            "Last bar ts mismatch after fill tf={} got={} expected={} (coverage_end_excl={})",
+            timeframe,
+            bars[-1].ts_ms,
+            expected_last_open,
+            end_ms_excl,
+        )
 
-    # Strict contiguity check - fail fast with the first gap location
+    # Safety assert: contiguous after fill
     for i in range(1, len(bars)):
         dt = bars[i].ts_ms - bars[i - 1].ts_ms
         if dt != tf_ms:
             raise RuntimeError(
-                f"Gap detected tf={timeframe}: prev={bars[i-1].ts_ms} curr={bars[i].ts_ms} "
+                f"Post-fill gap detected tf={timeframe}: prev={bars[i-1].ts_ms} curr={bars[i].ts_ms} "
                 f"delta={dt} expected={tf_ms}"
             )
 
+    if synthetic_count:
+        logger.warning(
+            "Synthetic fill applied tf={} injected={} total={}",
+            timeframe,
+            synthetic_count,
+            len(bars),
+        )
+
     logger.info("Bars range: first={} last={}", _fmt_iso(bars[0].ts_ms), _fmt_iso(bars[-1].ts_ms))
     logger.info(
-        "Loaded bars: {} (data_venue={} symbol={} tf={} start={} end={})",
+        "Loaded bars: {} (data_venue={} symbol={} run_tf={} configured_tfs={} start={} end={})",
         len(bars),
         venue,
         symbol,
         timeframe,
+        timeframes,
         cfg.history.start_date,
         cfg.history.end_date or "COVERAGE_END",
     )
 
-    # 4) Strategy + runtime engine
+    # Strategy + runtime engine
     strat = HTFTrendLTFEntryStrategy(
         HTFTrendLTFEntryConfig(
             htf_minutes=60,
@@ -213,7 +257,8 @@ async def run_simfill_backtest(cfg) -> None:
     print("===== TBV8 RUNTIME RESULT (SIMFILL) =====")
     print(f"Data venue:    {venue}")
     print(f"Symbol:        {symbol}")
-    print(f"Timeframe:     {timeframe}")
+    print(f"Run TF:        {timeframe}")
+    print(f"All TFs:       {timeframes}")
     print(f"Start equity:  ${res.starting_equity_usd:,.2f}")
     print(f"End equity:    ${res.ending_equity_usd:,.2f}")
     print(f"PnL:           ${res.total_pnl_usd:,.2f}")

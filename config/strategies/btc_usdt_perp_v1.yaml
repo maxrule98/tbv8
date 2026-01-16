@@ -1,6 +1,8 @@
 strategy_id: btc_usdt_perp_v1
 symbol: BTC/USDT
-timeframe: 5m
+timeframes:
+  - 1m
+  - 4h
 
 routing:
   primary: hyperliquid

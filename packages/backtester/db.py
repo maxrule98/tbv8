@@ -6,8 +6,6 @@ from pathlib import Path
 from typing import List, Optional
 
 
-from packages.common.constants import BASE_TIMEFRAME
-
 @dataclass(frozen=True)
 class BacktestBar:
     venue: str
@@ -26,7 +24,7 @@ class LoadBarsQuery:
     db_path: Path
     venue: str
     symbol: str
-    timeframe: str = BASE_TIMEFRAME
+    timeframe: str 
     start_ms: Optional[int] = None
     end_ms: Optional[int] = None
     limit: Optional[int] = None
