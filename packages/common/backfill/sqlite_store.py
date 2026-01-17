@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 from dataclasses import dataclass
-from typing import Iterable, Optional, Tuple
+from typing import Optional, Tuple
 
 from packages.common.timeframes import ceil_ts_to_tf, floor_ts_to_tf, timeframe_to_ms
 from packages.common.backfill.types import OHLCV
@@ -80,6 +80,7 @@ def ensure_bars_table(conn: sqlite3.Connection, tf: str) -> None:
     conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{t}_lookup ON {t} (venue, symbol, ts_ms);")
     conn.commit()
 
+
 # =========================
 # gap detection
 # =========================
@@ -103,6 +104,9 @@ def find_gaps_tf(
     """
     Find gaps in bars_{tf} where consecutive ts_ms differ != tf_ms.
     Returns ranges [gap_start, gap_end_excl) aligned to tf cadence.
+
+    NOTE: This detects *any* discontinuity: missing blocks, exchange data holes,
+    and any other discontinuous sections inside the scan window.
     """
     ensure_bars_table(conn, tf)
     table = _bars_table(tf)
@@ -302,3 +306,130 @@ def resolve_bar_window_from_coverage(
         return start_ms, end_ms_excl
     finally:
         conn.close()
+
+
+def resolve_contiguous_window(
+    *,
+    db_path: str,
+    venue: str,
+    symbol: str,
+    timeframe: str,
+    start_ms: int,
+    end_ms_excl: int,
+    min_window_candles: int = 500,
+    max_gaps_scan: int = 100_000,
+) -> Tuple[int, int]:
+    """
+    Choose the best contiguous sub-window inside [start_ms, end_ms_excl),
+    based on gaps detected in bars_{timeframe}.
+
+    This is for backtests when upstream data has a huge missing block (e.g. Binance 2018 gap).
+    We select a contiguous segment so your run-loop can be truly gap-free after optional
+    *synthetic* filling of small holes.
+
+    Rule:
+    - detect gaps via find_gaps_tf()
+    - build segments between gaps
+    - pick the longest segment with at least min_window_candles
+    """
+    tf_ms = timeframe_to_ms(timeframe)
+    min_len_ms = int(min_window_candles) * tf_ms
+
+    # normalize inputs to tf grid (defensive)
+    start_ms2 = ceil_ts_to_tf(int(start_ms), timeframe)
+    end_ms_excl2 = floor_ts_to_tf(int(end_ms_excl), timeframe)
+
+    if end_ms_excl2 <= start_ms2:
+        raise RuntimeError("resolve_contiguous_window: empty aligned window")
+
+    conn = sqlite3.connect(db_path)
+    try:
+        ensure_schema(conn)
+
+        gaps = find_gaps_tf(
+            conn,
+            venue=venue,
+            symbol=symbol,
+            tf=timeframe,
+            start_ms=start_ms2,
+            end_ms_excl=end_ms_excl2,
+            limit=max_gaps_scan,
+        )
+    finally:
+        conn.close()
+
+    # No gaps -> original window is already contiguous
+    if not gaps:
+        return start_ms2, end_ms_excl2
+
+    # Clamp gaps and sort
+    gaps2 = []
+    for g in gaps:
+        gs = max(start_ms2, int(g.start_ms))
+        ge = min(end_ms_excl2, int(g.end_ms_excl))
+        if ge > gs:
+            gaps2.append(GapRange(start_ms=gs, end_ms_excl=ge))
+    gaps2.sort(key=lambda x: x.start_ms)
+
+    # Merge overlapping/adjacent gaps (defensive)
+    merged: list[GapRange] = []
+    for g in gaps2:
+        if not merged:
+            merged.append(g)
+            continue
+        prev = merged[-1]
+        if g.start_ms <= prev.end_ms_excl:
+            merged[-1] = GapRange(start_ms=prev.start_ms, end_ms_excl=max(prev.end_ms_excl, g.end_ms_excl))
+        else:
+            merged.append(g)
+
+    # Build segments between gaps
+    segments: list[Tuple[int, int]] = []
+    cursor = start_ms2
+
+    for g in merged:
+        if g.start_ms > cursor:
+            segments.append((cursor, g.start_ms))
+        cursor = max(cursor, g.end_ms_excl)
+
+    if cursor < end_ms_excl2:
+        segments.append((cursor, end_ms_excl2))
+
+    # Pick best segment meeting min length
+    best = None
+    best_len = -1
+
+    for s, e in segments:
+        s2 = ceil_ts_to_tf(s, timeframe)
+        e2 = floor_ts_to_tf(e, timeframe)
+        if e2 <= s2:
+            continue
+        seg_len = e2 - s2
+        if seg_len >= min_len_ms and seg_len > best_len:
+            best = (s2, e2)
+            best_len = seg_len
+
+    if best is None:
+        # Fallback: choose longest segment even if short (still deterministic),
+        # but tell the caller explicitly via exception so they can tune min_window_candles.
+        longest = None
+        longest_len = -1
+        for s, e in segments:
+            s2 = ceil_ts_to_tf(s, timeframe)
+            e2 = floor_ts_to_tf(e, timeframe)
+            if e2 <= s2:
+                continue
+            seg_len = e2 - s2
+            if seg_len > longest_len:
+                longest = (s2, e2)
+                longest_len = seg_len
+
+        if longest is None:
+            raise RuntimeError("resolve_contiguous_window: no usable segments found")
+
+        raise RuntimeError(
+            f"resolve_contiguous_window: no segment meets min_window_candles={min_window_candles}. "
+            f"Longest segment candles={(longest_len // tf_ms) if tf_ms else 0}"
+        )
+
+    return best

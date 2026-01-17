@@ -1,26 +1,25 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable, Iterator, Optional, List
-import sqlite3
+from typing import Iterable, Iterator, Optional
 
-from packages.common.backfill.types import OHLCV
+from packages.backtester.types import Bar
 
 
 @dataclass(frozen=True)
 class RuntimeBar:
     """
     Runtime-only bar wrapper.
-    - `bar` is the real OHLCV payload (ts_ms/open/high/low/close/volume)
+    - `bar` is the OHLCV payload
     - `synthetic` tells you if it was forward-filled for a missing timestamp
     """
-    bar: OHLCV
+    bar: Bar
     synthetic: bool
 
 
-def make_synthetic_bar(*, ts_ms: int, prev_close: float) -> OHLCV:
+def make_synthetic_bar(*, ts_ms: int, prev_close: float) -> Bar:
     # volume=0, and OHLC all equal to last close
-    return OHLCV(
+    return Bar(
         ts_ms=int(ts_ms),
         open=float(prev_close),
         high=float(prev_close),
@@ -32,7 +31,7 @@ def make_synthetic_bar(*, ts_ms: int, prev_close: float) -> OHLCV:
 
 def fill_missing_bars(
     *,
-    bars: Iterable[OHLCV],
+    bars: Iterable[Bar],
     start_ms: int,
     end_ms_excl: int,
     tf_ms: int,
@@ -48,7 +47,7 @@ def fill_missing_bars(
     """
     it = iter(bars)
 
-    next_real: Optional[OHLCV] = next(it, None)
+    next_real: Optional[Bar] = next(it, None)
     last_close: Optional[float] = None
     have_anchor = False
 
@@ -75,37 +74,5 @@ def fill_missing_bars(
             syn = make_synthetic_bar(ts_ms=cursor, prev_close=last_close)
             yield RuntimeBar(bar=syn, synthetic=True)
 
-        # If no anchor yet, we skip (this covers “market didn’t exist yet”)
+        # If no anchor yet, we skip (covers “market didn’t exist yet”)
         cursor += tf_ms
-
-def read_bars_tf(
-    conn: sqlite3.Connection,
-    *,
-    tf: str,
-    venue: str,
-    symbol: str,
-    start_ms: int,
-    end_ms_excl: int,
-) -> List[OHLCV]:
-    table = f"bars_{tf}"
-    rows = conn.execute(
-        f"""
-        SELECT ts_ms, open, high, low, close, volume
-        FROM {table}
-        WHERE venue=? AND symbol=? AND ts_ms >= ? AND ts_ms < ?
-        ORDER BY ts_ms ASC
-        """,
-        (venue, symbol, int(start_ms), int(end_ms_excl)),
-    ).fetchall()
-
-    out: List[OHLCV] = []
-    for ts_ms, o, h, l, c, v in rows:
-        out.append(OHLCV(
-            ts_ms=int(ts_ms),
-            open=float(o),
-            high=float(h),
-            low=float(l),
-            close=float(c),
-            volume=float(v),
-        ))
-    return out

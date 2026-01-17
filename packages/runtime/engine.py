@@ -1,28 +1,60 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Optional, Protocol
+from typing import Any, Dict, List, Optional, Protocol, Sequence
 
 from packages.backtester.types import Bar
+from packages.market_data.bar_store import MultiTFBarStore
 from packages.execution.router import ExecutionRouter
 from packages.execution.simfill import SimFillExecutor
-from packages.execution.types import Fill, OrderIntent, OrderSide
+from packages.execution.types import OrderIntent, OrderSide
+
+
+# =========================
+# Strategy API (context-driven)
+# =========================
+
+@dataclass(frozen=True)
+class StrategyContext:
+    """
+    Passed to strategies each run-loop step.
+
+    - bar: the primary/run timeframe bar (the engine iterates on this stream)
+    - store: access to all timeframes (as-of bar.ts_ms)
+    - identity: data + execution venues, symbol, and run_tf
+    - state: per-strategy scratchpad (persists across calls)
+    """
+    bar: Bar
+    store: MultiTFBarStore
+
+    data_venue: str
+    exec_primary_venue: str
+    exec_shadow_venue: Optional[str]
+
+    symbol: str
+    run_tf: str
+
+    state: Dict[str, Any]
 
 
 class Strategy(Protocol):
-    def on_bar(self, bar: Bar) -> int:
+    def on_bar(self, ctx: StrategyContext) -> int:
         """
         Return target position: -1, 0, +1
         """
         ...
 
 
+# =========================
+# Runtime engine
+# =========================
+
 @dataclass(frozen=True)
 class RuntimeEngineConfig:
     # Data identity (what we're running on)
     data_venue: str
     symbol: str
-    timeframe: str
+    run_tf: str
 
     # Execution identity (where orders go)
     exec_primary_venue: str
@@ -52,7 +84,7 @@ class RuntimeResult:
     exec_primary_venue: str
     exec_shadow_venue: Optional[str]
     symbol: str
-    timeframe: str
+    run_tf: str
 
     starting_equity_usd: float
     ending_equity_usd: float
@@ -65,30 +97,37 @@ class RuntimeEngine:
     """
     Runtime (SIMFILL) engine.
 
-    Key invariants:
-    - Bars come from cfg.history.market_data_venue (data venue)
-    - Orders are attributed to cfg.strategy.routing.primary (execution venue)
-    - Shadow venue is wired but no side effects yet (we'll add shadow execution later)
+    Updated behaviour:
+    - Strategy is context-driven (ctx.bar + ctx.store for multi-TF as-of access).
+    - No hardcoded symbol/timeframes; identity is provided via config/context.
+
+    NOTE: accounting is still fees-only in this scaffold (as per current TBV8 state).
     """
 
     def __init__(
         self,
         cfg: RuntimeEngineConfig,
+        *,
         router: ExecutionRouter,
         executor: SimFillExecutor,
+        store: MultiTFBarStore,
     ):
         self.cfg = cfg
         self.router = router
         self.executor = executor
+        self.store = store
 
-    def run(self, bars: List[Bar], strat: Strategy) -> RuntimeResult:
+        # shared scratchpad for strategy runtime state
+        self._state: Dict[str, Any] = {}
+
+    def run(self, bars: Sequence[Bar], strat: Strategy) -> RuntimeResult:
         if not bars:
             return RuntimeResult(
                 data_venue=self.cfg.data_venue,
                 exec_primary_venue=self.cfg.exec_primary_venue,
                 exec_shadow_venue=self.cfg.exec_shadow_venue,
                 symbol=self.cfg.symbol,
-                timeframe=self.cfg.timeframe,
+                run_tf=self.cfg.run_tf,
                 starting_equity_usd=self.cfg.starting_equity_usd,
                 ending_equity_usd=self.cfg.starting_equity_usd,
                 total_pnl_usd=0.0,
@@ -103,19 +142,24 @@ class RuntimeEngine:
         total_fees = 0.0
 
         for bar in bars:
-            target = int(strat.on_bar(bar))
+            ctx = StrategyContext(
+                bar=bar,
+                store=self.store,
+                data_venue=self.cfg.data_venue,
+                exec_primary_venue=self.cfg.exec_primary_venue,
+                exec_shadow_venue=self.cfg.exec_shadow_venue,
+                symbol=self.cfg.symbol,
+                run_tf=self.cfg.run_tf,
+                state=self._state,
+            )
+
+            target = int(strat.on_bar(ctx))
             if target not in (-1, 0, 1):
                 raise ValueError(f"Strategy returned invalid target={target}")
 
             if target == position:
                 continue
 
-            # Determine order(s) needed to move from position -> target
-            # We execute at most one unit position, so transitions are:
-            #  0 -> 1 (buy), 0 -> -1 (sell)
-            #  1 -> 0 (sell), -1 -> 0 (buy)
-            #  1 -> -1 (sell then sell? No - we just close then open: two intents)
-            # -1 -> 1 (buy then buy: close then open)
             intents: List[OrderIntent] = []
 
             if position == 0 and target != 0:
@@ -125,23 +169,18 @@ class RuntimeEngine:
                 intents.append(self._intent_to_flat(position, bar.ts_ms, reason="exit_to_flat"))
 
             elif position != 0 and target != 0 and target != position:
-                # flip: close then open
                 intents.append(self._intent_to_flat(position, bar.ts_ms, reason="exit_to_change_target"))
                 intents.append(self._intent_from_target(target, bar.ts_ms, reason="enter_target"))
 
-            # Execute
             for intent in intents:
                 primary_venue = self.router.choose_primary()
                 if primary_venue != self.cfg.exec_primary_venue:
-                    # This should never diverge – if it does, we want to know immediately.
                     raise RuntimeError(
                         f"Router primary mismatch: router={primary_venue} cfg={self.cfg.exec_primary_venue}"
                     )
 
                 fill = self.executor.execute(price=float(bar.close), intent=intent)
 
-                # PnL accounting (simple): fees reduce equity; price movement is ignored in this SIMFILL scaffold.
-                # In TBV8 we will replace this with proper PnL / inventory accounting.
                 equity -= float(fill.fee_usd)
                 total_fees += float(fill.fee_usd)
 
@@ -172,7 +211,7 @@ class RuntimeEngine:
             exec_primary_venue=self.cfg.exec_primary_venue,
             exec_shadow_venue=self.cfg.exec_shadow_venue,
             symbol=self.cfg.symbol,
-            timeframe=self.cfg.timeframe,
+            run_tf=self.cfg.run_tf,
             starting_equity_usd=self.cfg.starting_equity_usd,
             ending_equity_usd=ending,
             total_pnl_usd=pnl,
@@ -191,7 +230,6 @@ class RuntimeEngine:
         )
 
     def _intent_to_flat(self, position: int, ts_ms: int, reason: str) -> OrderIntent:
-        # If long, sell to close. If short, buy to close.
         side = OrderSide.SELL if position > 0 else OrderSide.BUY
         return OrderIntent(
             symbol=self.cfg.symbol,
